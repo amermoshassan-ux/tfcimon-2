@@ -5,7 +5,6 @@ const { Client, GatewayIntentBits, SlashCommandBuilder, EmbedBuilder, ActionRowB
 const BOT_TOKEN = process.env.BOT_TOKEN || 'YOUR_BOT_TOKEN_HERE';
 const CLIENT_ID = process.env.CLIENT_ID || 'YOUR_CLIENT_ID_HERE';
 const OP_USER = 'haxiii7';
-const OP_USER = 'windy_blade555';
 // ─── CARD DATA ────────────────────────────────────────────────────────────────
 
 const CARDS = {
