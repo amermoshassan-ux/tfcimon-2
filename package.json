@@ -1,0 +1,12 @@
+{
+  "name": "tfcimon-bot",
+  "version": "1.0.0",
+  "description": "TFCImon Discord Bot - like Pokémon but with TFCImon cards!",
+  "main": "bot.js",
+  "scripts": {
+    "start": "node bot.js"
+  },
+  "dependencies": {
+    "discord.js": "^14.15.3"
+  }
+}
