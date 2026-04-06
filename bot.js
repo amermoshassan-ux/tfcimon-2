@@ -4,8 +4,8 @@ const { Client, GatewayIntentBits, SlashCommandBuilder, EmbedBuilder, ActionRowB
 const fs = require('fs');
 const path = require('path');
 
-const BOT_TOKEN = process.env.BOT_TOKEN || 'YOUR_BOT_TOKEN_HERE';
-const CLIENT_ID = process.env.CLIENT_ID || 'YOUR_CLIENT_ID_HERE';
+const BOT_TOKEN = process.env.BOT_TOKEN || 'MTQ5MDQzNzM4OTYwMzA0NTQ5Nw.GwKU8r.krAPW5cYdnjBkvUtP7CPX73qlkYAtXW9GaIdn0';
+const CLIENT_ID = process.env.CLIENT_ID || '1490437389603045497';
 const OP_USER = 'haxiii7';
 
 // ─── PERSISTENT STORAGE ───────────────────────────────────────────────────────
@@ -1783,5 +1783,5 @@ async function sendArenaBattleState(channel, battleId, lastAction = null) {
 
 (async () => {
   await registerCommands();
-  await client.login(BOT_TOKEN);
+  await client.login(MTQ5MDQzNzM4OTYwMzA0NTQ5Nw.GwKU8r.krAPW5cYdnjBkvUtP7CPX73qlkYAtXW9GaIdn0);
 })();
