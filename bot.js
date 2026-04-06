@@ -21,7 +21,7 @@ function loadData() {
   } catch (e) {
     console.error('Failed to load data.json:', e.message);
   }
-  return { players: {}, arenas: {}, auctionListings: {}, listingCounter: 1, doubleGemsEvent: false, customCards: {}, opUsers: [], bounties: {}, bannedUsers: [] };
+  return { players: {}, arenas: {}, auctionListings: {}, listingCounter: 1, doubleGemsEvent: false, xpBoostEvent: false, customCards: {}, opUsers: [], bounties: {}, bannedUsers: [], frozenUsers: [] };
 }
 
 function saveData() {
@@ -32,10 +32,12 @@ function saveData() {
       auctionListings: Object.fromEntries(auctionListings),
       listingCounter,
       doubleGemsEvent,
+      xpBoostEvent,
       customCards: Object.fromEntries(Object.entries(CARDS).filter(([id]) => id.startsWith('custom_'))),
       opUsers,
       bounties: Object.fromEntries(bounties),
       bannedUsers,
+      frozenUsers,
     };
     fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2));
   } catch (e) {
@@ -237,10 +239,11 @@ for (const [id, card] of Object.entries(savedData.customCards || {})) {
 const auctionListings = new Map(Object.entries(savedData.auctionListings || {}).map(([k, v]) => [parseInt(k), v]));
 let listingCounter = savedData.listingCounter || 1;
 let doubleGemsEvent = savedData.doubleGemsEvent || false;
+let xpBoostEvent = savedData.xpBoostEvent || false;
 let opUsers = savedData.opUsers || [];
-// bounties: Map<targetUserId, { amount, setBy, setByName, targetName }>
 const bounties = new Map(Object.entries(savedData.bounties || {}));
 let bannedUsers = savedData.bannedUsers || [];
+let frozenUsers = savedData.frozenUsers || [];
 
 const activeBattles = new Map();
 const activeArenaBattles = new Map();
@@ -273,6 +276,10 @@ function getPlayer(userId) {
 
 function isBanned(userId) {
   return bannedUsers.includes(userId);
+}
+
+function isFrozen(userId) {
+  return frozenUsers.includes(userId);
 }
 
 function getCardLevel(player, cardId) { return player.cardLevels[cardId] || 1; }
@@ -309,6 +316,9 @@ function isOp(interaction) {
 }
 
 function gemMultiplier() { return doubleGemsEvent ? 2 : 1; }
+
+// XP boost: win threshold to level up is halved (every 2 wins instead of 3)
+function xpThreshold() { return xpBoostEvent ? 2 : 3; }
 
 function getBattleCard(player) {
   if (player.activeDeck && player.activeDeck.length > 0) {
@@ -350,10 +360,13 @@ function buildDeckEmbed(userId, player, displayName) {
     embed.addFields({ name: '🎯 Active Battle Deck', value: activeNames });
   }
 
-  // Show bounty on this player if one exists
   if (bounties.has(userId)) {
     const b = bounties.get(userId);
     embed.addFields({ name: '🎯 BOUNTY', value: `**${b.amount}💎** — set by ${b.setByName}` });
+  }
+
+  if (isFrozen(userId)) {
+    embed.addFields({ name: '🧊 FROZEN', value: 'This player cannot battle or gamble.' });
   }
 
   embed.addFields({ name: '🃏 Total Cards', value: `${player.deck.length}`, inline: true });
@@ -372,6 +385,7 @@ function buildCardInfoEmbed(card) {
       { name: '💎 Shop Price', value: `${card.gemCost}💎`, inline: true },
       { name: '💰 Sell Value', value: `${Math.round(card.gemCost * SELL_BACK_RATE)}💎`, inline: true },
     );
+  if (card.lore) embed.addFields({ name: '📖 Lore', value: card.lore });
   const movesText = card.moves.map(m => `${m.emoji} **${m.name}** — ${m.damage} dmg | Cost: ${m.cost}⚡${m.isEx ? ' ✨EX' : ''}`).join('\n');
   embed.addFields({ name: '⚔️ Moves', value: movesText });
   return embed;
@@ -581,6 +595,67 @@ const commands = [
 
   new SlashCommandBuilder().setName('removebounty').setDescription('[OP] Remove a bounty from a player')
     .addUserOption(opt => opt.setName('user').setDescription('Target player').setRequired(true)).toJSON(),
+
+  // ════ NEW OP COMMANDS ════
+
+  // /addmove — add a custom move to any existing card
+  new SlashCommandBuilder().setName('addmove').setDescription('[OP] Add a new move to any existing card')
+    .addStringOption(opt => opt.setName('card').setDescription('Card ID to add the move to').setRequired(true))
+    .addStringOption(opt => opt.setName('movename').setDescription('Name of the new move').setRequired(true))
+    .addIntegerOption(opt => opt.setName('damage').setDescription('Damage of the move').setRequired(true).setMinValue(1))
+    .addIntegerOption(opt => opt.setName('cost').setDescription('Energy cost (1-7)').setRequired(true).setMinValue(1).setMaxValue(7))
+    .addStringOption(opt => opt.setName('emoji').setDescription('Emoji for the move').setRequired(false))
+    .addBooleanOption(opt => opt.setName('isex').setDescription('Is this an EX move? (red button, special power)').setRequired(false))
+    .toJSON(),
+
+  // /removemove — remove a move from a card by index
+  new SlashCommandBuilder().setName('removemove').setDescription('[OP] Remove a move from a card by its index (0 = first move)')
+    .addStringOption(opt => opt.setName('card').setDescription('Card ID').setRequired(true))
+    .addIntegerOption(opt => opt.setName('index').setDescription('Move index to remove (0, 1, 2...)').setRequired(true).setMinValue(0).setMaxValue(9))
+    .toJSON(),
+
+  // /masspacks — give packs to all registered players
+  new SlashCommandBuilder().setName('masspacks').setDescription('[OP] Give a pack drop event — give every player X free packs!')
+    .addIntegerOption(opt => opt.setName('packs').setDescription('Number of packs to give each player (default 1)').setMinValue(1).setMaxValue(10))
+    .toJSON(),
+
+  // /massgems — give gems to everyone
+  new SlashCommandBuilder().setName('massgems').setDescription('[OP] Give gems to every registered player')
+    .addIntegerOption(opt => opt.setName('amount').setDescription('Gems to give each player').setRequired(true).setMinValue(1))
+    .toJSON(),
+
+  // /setbio — set lore/bio text on a card
+  new SlashCommandBuilder().setName('setbio').setDescription('[OP] Set flavor lore text on a card')
+    .addStringOption(opt => opt.setName('card').setDescription('Card ID').setRequired(true))
+    .addStringOption(opt => opt.setName('lore').setDescription('Lore / bio text (max 200 chars)').setRequired(true).setMaxLength(200))
+    .toJSON(),
+
+  // /freeze / /unfreeze — lock a player out of battles and gambling
+  new SlashCommandBuilder().setName('freeze').setDescription('[OP] Freeze a player — they can\'t battle or gamble')
+    .addUserOption(opt => opt.setName('user').setDescription('Player to freeze').setRequired(true))
+    .addStringOption(opt => opt.setName('reason').setDescription('Reason (optional)'))
+    .toJSON(),
+
+  new SlashCommandBuilder().setName('unfreeze').setDescription('[OP] Unfreeze a player')
+    .addUserOption(opt => opt.setName('user').setDescription('Player to unfreeze').setRequired(true))
+    .toJSON(),
+
+  // /ahdelist — force-remove any AH listing by ID
+  new SlashCommandBuilder().setName('ahdelist').setDescription('[OP] Force-remove an auction house listing by ID')
+    .addIntegerOption(opt => opt.setName('id').setDescription('Listing ID to remove').setRequired(true).setMinValue(1))
+    .addBooleanOption(opt => opt.setName('refund').setDescription('Return the card to the seller? (default: true)'))
+    .toJSON(),
+
+  // /xpboost — toggle XP boost event (level up twice as fast)
+  new SlashCommandBuilder().setName('xpboost').setDescription('[OP] Toggle XP Boost event — cards level up in half the wins!').toJSON(),
+
+  // /oplist — see who has OP
+  new SlashCommandBuilder().setName('oplist').setDescription('[OP] View all users with OP permissions').toJSON(),
+
+  // /revoke — remove OP from a user
+  new SlashCommandBuilder().setName('revoke').setDescription('[OP] Revoke OP permissions from a user')
+    .addUserOption(opt => opt.setName('user').setDescription('User to revoke OP from').setRequired(true))
+    .toJSON(),
 ];
 
 // ─── REGISTER ─────────────────────────────────────────────────────────────────
@@ -614,10 +689,16 @@ client.on('interactionCreate', async (interaction) => {
     const { commandName } = interaction;
     const userId = interaction.user.id;
 
-    // Ban check (allow OP commands to pass through)
-    const opCommandsList = ['op','makecard','editcard','setrarity','setgems','givegems','takegems','givecard','kill','wipeall','clonecard','banplayer','unbanplayer','setarenacholder','broadcast','resetarena','announce','doublegems','tournament','listcards','setbounty','removebounty'];
+    const opCommandsList = ['op','makecard','editcard','setrarity','setgems','givegems','takegems','givecard','kill','wipeall','clonecard','banplayer','unbanplayer','setarenacholder','broadcast','resetarena','announce','doublegems','tournament','listcards','setbounty','removebounty','addmove','removemove','masspacks','massgems','setbio','freeze','unfreeze','ahdelist','xpboost','oplist','revoke'];
+
     if (isBanned(userId) && !opCommandsList.includes(commandName)) {
       return interaction.reply({ content: '🚫 You are banned from TFCImon.', ephemeral: true });
+    }
+
+    // Frozen players can't battle or gamble
+    const freezeBlockedCommands = ['battle', 'challenge', 'gamble', 'coinflip', 'slots', 'dice'];
+    if (isFrozen(userId) && freezeBlockedCommands.includes(commandName)) {
+      return interaction.reply({ content: '🧊 You are frozen and cannot battle or gamble right now.', ephemeral: true });
     }
 
     const player = getPlayer(userId);
@@ -706,7 +787,7 @@ client.on('interactionCreate', async (interaction) => {
 
     // /gems
     else if (commandName === 'gems') {
-      await interaction.reply({ embeds: [new EmbedBuilder().setTitle('💎 Your Gems').setDescription(`You have **${player.gems} gems**!\n\n• Opening packs: +${10 * gemMultiplier()}💎\n• Win PvP: +${25 * gemMultiplier()}💎\n• Conquer arena: +${50 * gemMultiplier()}💎\n• Daily reward: up to 200💎\n• Gambling 🎰\n• Selling cards 💰${doubleGemsEvent ? '\n\n🎉 **DOUBLE GEMS EVENT ACTIVE!**' : ''}`).setColor(0xf1c40f)] });
+      await interaction.reply({ embeds: [new EmbedBuilder().setTitle('💎 Your Gems').setDescription(`You have **${player.gems} gems**!\n\n• Opening packs: +${10 * gemMultiplier()}💎\n• Win PvP: +${25 * gemMultiplier()}💎\n• Conquer arena: +${50 * gemMultiplier()}💎\n• Daily reward: up to 200💎\n• Gambling 🎰\n• Selling cards 💰${doubleGemsEvent ? '\n\n🎉 **DOUBLE GEMS EVENT ACTIVE!**' : ''}${xpBoostEvent ? '\n⚡ **XP BOOST EVENT ACTIVE!**' : ''}`).setColor(0xf1c40f)] });
     }
 
     // /daily
@@ -736,11 +817,12 @@ client.on('interactionCreate', async (interaction) => {
       );
       const holders = Object.values(ARENAS).filter(a => a.holder).map(a => `${a.emoji} **${a.name}** → ${a.holderName}`).join('\n');
       if (holders) embed.addFields({ name: '🏟️ Arena Holders', value: holders });
-      // Show active bounties
       if (bounties.size > 0) {
-        const bList = [...bounties.entries()].map(([tid, b]) => `🎯 **${b.targetName}** — **${b.amount}💎**`).join('\n');
+        const bList = [...bounties.entries()].map(([, b]) => `🎯 **${b.targetName}** — **${b.amount}💎**`).join('\n');
         embed.addFields({ name: '🎯 Active Bounties', value: bList });
       }
+      if (doubleGemsEvent) embed.addFields({ name: '🎉 Events', value: `Double Gems is ON!${xpBoostEvent ? '\n⚡ XP Boost is ON!' : ''}` });
+      else if (xpBoostEvent) embed.addFields({ name: '⚡ Events', value: 'XP Boost is ON!' });
       await interaction.reply({ embeds: [embed] });
     }
 
@@ -764,12 +846,13 @@ client.on('interactionCreate', async (interaction) => {
         const b = bounties.get(userId);
         embed.addFields({ name: '🎯 Bounty on You', value: `**${b.amount}💎** — set by ${b.setByName}` });
       }
+      if (isFrozen(userId)) embed.addFields({ name: '🧊 Status', value: 'Frozen — cannot battle or gamble.' });
       await interaction.reply({ embeds: [embed] });
     }
 
     // /shop
     else if (commandName === 'shop') {
-      const embed = new EmbedBuilder().setTitle('🛒 TFCImon Gem Shop').setDescription(`Balance: **${player.gems}💎**\nSell cards with \`/sell\` for ${Math.round(SELL_BACK_RATE * 100)}% back.${doubleGemsEvent ? '\n🎉 **DOUBLE GEMS EVENT!**' : ''}`).setColor(0xf1c40f).addFields({ name: '📦 Pack (150💎)', value: '3 random cards — `/buypack`' });
+      const embed = new EmbedBuilder().setTitle('🛒 TFCImon Gem Shop').setDescription(`Balance: **${player.gems}💎**\nSell cards with \`/sell\` for ${Math.round(SELL_BACK_RATE * 100)}% back.${doubleGemsEvent ? '\n🎉 **DOUBLE GEMS EVENT!**' : ''}${xpBoostEvent ? '\n⚡ **XP BOOST EVENT!**' : ''}`).setColor(0xf1c40f).addFields({ name: '📦 Pack (150💎)', value: '3 random cards — `/buypack`' });
       for (const c of Object.values(CARDS).filter(c => !c.id.startsWith('custom_'))) {
         embed.addFields({ name: `${c.emoji} ${c.name} (${c.gemCost}💎)`, value: `${c.rarity} | ${c.hp}HP`, inline: true });
       }
@@ -842,6 +925,7 @@ client.on('interactionCreate', async (interaction) => {
       if (opponent.id === challenger.id) return interaction.reply({ content: '❌ Cannot battle yourself!', ephemeral: true });
       if (opponent.bot) return interaction.reply({ content: '❌ Cannot battle a bot!', ephemeral: true });
       if (isBanned(opponent.id)) return interaction.reply({ content: '❌ That player is banned.', ephemeral: true });
+      if (isFrozen(opponent.id)) return interaction.reply({ content: `❌ **${opponent.displayName}** is frozen and cannot battle right now.`, ephemeral: true });
       const cp = getPlayer(challenger.id); const op = getPlayer(opponent.id);
       if (cp.deck.length === 0) return interaction.reply({ content: '❌ You have no cards!', ephemeral: true });
       if (op.deck.length === 0) return interaction.reply({ content: `❌ ${opponent.displayName} has no cards!`, ephemeral: true });
@@ -919,7 +1003,6 @@ client.on('interactionCreate', async (interaction) => {
         resultText = `✅ **${multiplier}x multiplier!** +${winnings}💎`;
       }
       saveData();
-
       const payoutTable = Object.entries(SLOT_PAYOUTS).filter(([k]) => k !== 'pair').map(([k, v]) => `${k} = **${v}x**`).join(' | ');
       await interaction.reply({ embeds: [new EmbedBuilder()
         .setTitle('🎰 Slot Machine!')
@@ -995,7 +1078,7 @@ client.on('interactionCreate', async (interaction) => {
     else if (commandName === 'bounties') {
       if (bounties.size === 0) return interaction.reply({ content: '🎯 No active bounties right now!', ephemeral: false });
       const embed = new EmbedBuilder().setTitle('🎯 Active Bounties').setDescription('Defeat these players in PvP to collect the reward!').setColor(0xe17055);
-      for (const [tid, b] of bounties.entries()) {
+      for (const [, b] of bounties.entries()) {
         embed.addFields({ name: `${b.targetName}`, value: `💰 **${b.amount}💎** — set by ${b.setByName}` });
       }
       await interaction.reply({ embeds: [embed] });
@@ -1088,7 +1171,25 @@ client.on('interactionCreate', async (interaction) => {
       const target = interaction.options.getUser('user');
       if (opUsers.includes(target.id)) return interaction.reply({ content: `❌ **${target.displayName}** is already OP!`, ephemeral: true });
       opUsers.push(target.id); saveData();
-      await interaction.reply({ embeds: [new EmbedBuilder().setTitle('👑 OP Granted!').setDescription(`**${target.displayName}** has been granted OP permissions!`).setColor(0xf1c40f)] });
+      await interaction.reply({ embeds: [new EmbedBuilder().setTitle('👑 OP Granted!').setDescription(`**${target.displayName}** has been granted OP permissions by **${interaction.user.displayName}**!\n\nThey now have access to all OP commands.`).setColor(0xf1c40f).setFooter({ text: `Granted by ${interaction.user.displayName}` })] });
+    }
+
+    // /revoke
+    else if (commandName === 'revoke') {
+      if (!isOp(interaction)) return interaction.reply({ content: '❌ No permission.', ephemeral: true });
+      const target = interaction.options.getUser('user');
+      if (target.username === OP_USER) return interaction.reply({ content: `❌ Cannot revoke the original OP user!`, ephemeral: true });
+      if (!opUsers.includes(target.id)) return interaction.reply({ content: `❌ **${target.displayName}** does not have OP.`, ephemeral: true });
+      opUsers = opUsers.filter(id => id !== target.id); saveData();
+      await interaction.reply({ embeds: [new EmbedBuilder().setTitle('🔒 OP Revoked').setDescription(`**${target.displayName}**'s OP permissions have been revoked by **${interaction.user.displayName}**.`).setColor(0xe74c3c)] });
+    }
+
+    // /oplist
+    else if (commandName === 'oplist') {
+      if (!isOp(interaction)) return interaction.reply({ content: '❌ No permission.', ephemeral: true });
+      const lines = [`👑 **${OP_USER}** (original OP — permanent)`];
+      for (const id of opUsers) lines.push(`🔑 <@${id}>`);
+      await interaction.reply({ embeds: [new EmbedBuilder().setTitle('👑 TFCImon OP Users').setDescription(lines.join('\n')).setColor(0xf1c40f).setFooter({ text: `${opUsers.length + 1} total OP users` })], ephemeral: true });
     }
 
     // /makecard
@@ -1118,6 +1219,161 @@ client.on('interactionCreate', async (interaction) => {
         .setTitle(`${emoji} Custom Card Created: ${name}`)
         .setDescription(`**${hp}HP | ${type} | ${rarity}**\n\n${movesText}${giveToUser ? `\n\n✅ Given to **${giveToUser.displayName}**!` : ''}`)
         .setColor(0x6c5ce7).setFooter({ text: `Card ID: ${newId} | Shop price: ${gemCost}💎` })
+      ] });
+    }
+
+    // /addmove
+    else if (commandName === 'addmove') {
+      if (!isOp(interaction)) return interaction.reply({ content: '❌ No permission.', ephemeral: true });
+      const cardId = interaction.options.getString('card');
+      const card = CARDS[cardId];
+      if (!card) return interaction.reply({ content: `❌ Card with ID **${cardId}** not found! Use \`/listcards\` to find card IDs.`, ephemeral: true });
+      if (card.moves.length >= 6) return interaction.reply({ content: `❌ **${card.name}** already has 6 moves (max). Remove one first with \`/removemove\`.`, ephemeral: true });
+      const moveName = interaction.options.getString('movename');
+      const damage = interaction.options.getInteger('damage');
+      const cost = interaction.options.getInteger('cost');
+      const moveEmoji = interaction.options.getString('emoji') || '⚔️';
+      const isEx = interaction.options.getBoolean('isex') || false;
+      const newMove = { name: moveName, damage, cost, emoji: moveEmoji, ...(isEx ? { isEx: true } : {}) };
+      card.moves.push(newMove);
+      saveData();
+      await interaction.reply({ embeds: [new EmbedBuilder()
+        .setTitle(`${card.emoji} Move Added to ${card.name}!`)
+        .setDescription(`**New Move:** ${moveEmoji} **${moveName}**\n💥 Damage: **${damage}** | ⚡ Cost: **${cost}**${isEx ? ' | ✨ EX Move' : ''}\n\n**All Moves:**\n${card.moves.map((m, i) => `${i}: ${m.emoji} **${m.name}** — ${m.damage}dmg (${m.cost}⚡)${m.isEx ? ' ✨EX' : ''}`).join('\n')}`)
+        .setColor(card.color || 0x6c5ce7)
+      ] });
+    }
+
+    // /removemove
+    else if (commandName === 'removemove') {
+      if (!isOp(interaction)) return interaction.reply({ content: '❌ No permission.', ephemeral: true });
+      const cardId = interaction.options.getString('card');
+      const card = CARDS[cardId];
+      if (!card) return interaction.reply({ content: `❌ Card **${cardId}** not found!`, ephemeral: true });
+      const index = interaction.options.getInteger('index');
+      if (index >= card.moves.length) return interaction.reply({ content: `❌ **${card.name}** only has ${card.moves.length} moves (indices 0–${card.moves.length - 1}).`, ephemeral: true });
+      if (card.moves.length <= 1) return interaction.reply({ content: `❌ **${card.name}** must have at least 1 move!`, ephemeral: true });
+      const removed = card.moves.splice(index, 1)[0];
+      saveData();
+      await interaction.reply({ embeds: [new EmbedBuilder()
+        .setTitle(`${card.emoji} Move Removed from ${card.name}`)
+        .setDescription(`Removed: ${removed.emoji} **${removed.name}** (${removed.damage}dmg, ${removed.cost}⚡)\n\n**Remaining Moves:**\n${card.moves.map((m, i) => `${i}: ${m.emoji} **${m.name}** — ${m.damage}dmg (${m.cost}⚡)`).join('\n')}`)
+        .setColor(0xe74c3c)
+      ] });
+    }
+
+    // /masspacks
+    else if (commandName === 'masspacks') {
+      if (!isOp(interaction)) return interaction.reply({ content: '❌ No permission.', ephemeral: true });
+      const packCount = interaction.options.getInteger('packs') || 1;
+      await interaction.deferReply();
+      let count = 0;
+      for (const [, p] of playerData) {
+        for (let i = 0; i < packCount; i++) {
+          const pulled = openPack(3);
+          for (const id of pulled) id === 'energy' ? p.energyCards++ : p.deck.push(id);
+        }
+        count++;
+      }
+      saveData();
+      await interaction.editReply({ embeds: [new EmbedBuilder()
+        .setTitle('🎁 Mass Pack Drop!')
+        .setDescription(`**${interaction.user.displayName}** gifted **${packCount} pack${packCount > 1 ? 's' : ''}** to every registered player!\n\n📦 **${count} players** received their packs.\n*${packCount * 3 * count} total cards distributed!*`)
+        .setColor(0x00b894)
+        .setFooter({ text: 'Check your deck with /deck!' })
+      ] });
+    }
+
+    // /massgems
+    else if (commandName === 'massgems') {
+      if (!isOp(interaction)) return interaction.reply({ content: '❌ No permission.', ephemeral: true });
+      const amount = interaction.options.getInteger('amount');
+      let count = 0;
+      for (const [, p] of playerData) { p.gems += amount; count++; }
+      saveData();
+      await interaction.reply({ embeds: [new EmbedBuilder()
+        .setTitle('💎 Mass Gem Drop!')
+        .setDescription(`**${interaction.user.displayName}** dropped **${amount}💎** into everyone's wallet!\n\n✅ **${count} players** each received **${amount}💎**.\n*Total distributed: ${amount * count}💎*`)
+        .setColor(0xf1c40f)
+      ] });
+    }
+
+    // /setbio
+    else if (commandName === 'setbio') {
+      if (!isOp(interaction)) return interaction.reply({ content: '❌ No permission.', ephemeral: true });
+      const cardId = interaction.options.getString('card');
+      const lore = interaction.options.getString('lore');
+      const card = CARDS[cardId];
+      if (!card) return interaction.reply({ content: `❌ Card **${cardId}** not found!`, ephemeral: true });
+      card.lore = lore; saveData();
+      await interaction.reply({ embeds: [new EmbedBuilder()
+        .setTitle(`📖 Lore Set — ${card.emoji} ${card.name}`)
+        .setDescription(`> *${lore}*`)
+        .setColor(card.color || 0x9b59b6)
+        .setFooter({ text: 'View it with /cardinfo' })
+      ] });
+    }
+
+    // /freeze
+    else if (commandName === 'freeze') {
+      if (!isOp(interaction)) return interaction.reply({ content: '❌ No permission.', ephemeral: true });
+      const target = interaction.options.getUser('user');
+      const reason = interaction.options.getString('reason') || 'No reason given.';
+      if (frozenUsers.includes(target.id)) return interaction.reply({ content: `❌ **${target.displayName}** is already frozen.`, ephemeral: true });
+      frozenUsers.push(target.id); saveData();
+      await interaction.reply({ embeds: [new EmbedBuilder()
+        .setTitle('🧊 Player Frozen!')
+        .setDescription(`**${target.displayName}** has been frozen.\nThey cannot battle or gamble.\n**Reason:** ${reason}`)
+        .setColor(0x74b9ff)
+        .setFooter({ text: `Use /unfreeze to lift.` })
+      ] });
+    }
+
+    // /unfreeze
+    else if (commandName === 'unfreeze') {
+      if (!isOp(interaction)) return interaction.reply({ content: '❌ No permission.', ephemeral: true });
+      const target = interaction.options.getUser('user');
+      if (!frozenUsers.includes(target.id)) return interaction.reply({ content: `❌ **${target.displayName}** is not frozen.`, ephemeral: true });
+      frozenUsers = frozenUsers.filter(id => id !== target.id); saveData();
+      await interaction.reply({ embeds: [new EmbedBuilder()
+        .setTitle('🌡️ Player Unfrozen!')
+        .setDescription(`**${target.displayName}** can battle and gamble again.`)
+        .setColor(0x00b894)
+      ] });
+    }
+
+    // /ahdelist
+    else if (commandName === 'ahdelist') {
+      if (!isOp(interaction)) return interaction.reply({ content: '❌ No permission.', ephemeral: true });
+      const listingId = interaction.options.getInteger('id');
+      const refund = interaction.options.getBoolean('refund') ?? true;
+      const listing = auctionListings.get(listingId);
+      if (!listing) return interaction.reply({ content: `❌ Listing **#${listingId}** not found.`, ephemeral: true });
+      const card = CARDS[listing.cardId];
+      // Refund the highest bidder if there was a bid
+      if (listing.highestBidder && listing.currentBid) {
+        getPlayer(listing.highestBidder).gems += listing.currentBid;
+      }
+      // Return card to seller if refund=true
+      if (refund) {
+        getPlayer(listing.sellerId).deck.push(listing.cardId);
+      }
+      auctionListings.delete(listingId); saveData();
+      await interaction.reply({ embeds: [new EmbedBuilder()
+        .setTitle('🏪 Listing Removed!')
+        .setDescription(`Listing **#${listingId}** (${card?.emoji} **${card?.name}** — ${listing.sellerName}) has been removed.\n${refund ? `✅ Card returned to **${listing.sellerName}**.` : '⚠️ Card NOT returned (refund=false).'}${listing.highestBidder ? `\n💎 Bid of **${listing.currentBid}💎** returned to <@${listing.highestBidder}>.` : ''}`)
+        .setColor(0xe74c3c)
+      ] });
+    }
+
+    // /xpboost
+    else if (commandName === 'xpboost') {
+      if (!isOp(interaction)) return interaction.reply({ content: '❌ No permission.', ephemeral: true });
+      xpBoostEvent = !xpBoostEvent; saveData();
+      await interaction.reply({ embeds: [new EmbedBuilder()
+        .setTitle(xpBoostEvent ? '⚡ XP Boost STARTED!' : '⏹️ XP Boost ENDED!')
+        .setDescription(xpBoostEvent ? `Cards now level up every **${xpThreshold()} wins** instead of 3!\nGrind those battles! 💪` : 'Back to normal — 3 wins per level up.')
+        .setColor(xpBoostEvent ? 0xfdcb6e : 0x636e72)
       ] });
     }
 
@@ -1287,9 +1543,9 @@ client.on('interactionCreate', async (interaction) => {
       const allCards = Object.values(CARDS);
       const custom = allCards.filter(c => c.id.startsWith('custom_'));
       const base = allCards.filter(c => !c.id.startsWith('custom_'));
-      let desc = `**Base Cards (${base.length}):**\n${base.map(c => `${c.emoji} ${c.name} — ID: \`${c.id}\``).join('\n')}`;
-      if (custom.length > 0) desc += `\n\n**Custom Cards (${custom.length}):**\n${custom.map(c => `${c.emoji} ${c.name} — ID: \`${c.id}\``).join('\n')}`;
-      await interaction.reply({ embeds: [new EmbedBuilder().setTitle('📋 All TFCImon Cards').setDescription(desc).setColor(0x6c5ce7)] });
+      let desc = `**Base Cards (${base.length}):**\n${base.map(c => `${c.emoji} ${c.name} — ID: \`${c.id}\` | ${c.moves.length} moves`).join('\n')}`;
+      if (custom.length > 0) desc += `\n\n**Custom Cards (${custom.length}):**\n${custom.map(c => `${c.emoji} ${c.name} — ID: \`${c.id}\` | ${c.moves.length} moves`).join('\n')}`;
+      await interaction.reply({ embeds: [new EmbedBuilder().setTitle('📋 All TFCImon Cards').setDescription(desc).setColor(0x6c5ce7)], ephemeral: true });
     }
 
     // /setbounty
@@ -1427,10 +1683,10 @@ client.on('interactionCreate', async (interaction) => {
         atkP.cardWins[attacker.cardId] = (atkP.cardWins[attacker.cardId] || 0) + 1;
         defP.losses++; defP.cardLosses[defender.cardId] = (defP.cardLosses[defender.cardId] || 0) + 1;
         const cWins = atkP.cardWins[attacker.cardId];
-        if (cWins % 3 === 0) atkP.cardLevels[attacker.cardId] = (atkP.cardLevels[attacker.cardId] || 1) + 1;
-        const lvlMsg = cWins % 3 === 0 ? `\n⬆️ **${aCard.name}** leveled up to Lv${atkP.cardLevels[attacker.cardId]}!` : '';
+        const threshold = xpThreshold();
+        if (cWins % threshold === 0) atkP.cardLevels[attacker.cardId] = (atkP.cardLevels[attacker.cardId] || 1) + 1;
+        const lvlMsg = cWins % threshold === 0 ? `\n⬆️ **${aCard.name}** leveled up to Lv${atkP.cardLevels[attacker.cardId]}!${xpBoostEvent ? ' *(XP Boost!)*' : ''}` : '';
 
-        // ── BOUNTY CHECK ──
         let bountyMsg = '';
         if (bounties.has(defender.id)) {
           const b = bounties.get(defender.id);
@@ -1466,7 +1722,8 @@ client.on('interactionCreate', async (interaction) => {
         const gemGain = 50 * gemMultiplier();
         const wp = getPlayer(ab.userId); wp.gems += gemGain; wp.wins++;
         wp.cardWins[ab.cardId] = (wp.cardWins[ab.cardId] || 0) + 1;
-        if (wp.cardWins[ab.cardId] % 3 === 0) wp.cardLevels[ab.cardId] = (wp.cardLevels[ab.cardId] || 1) + 1;
+        const threshold = xpThreshold();
+        if (wp.cardWins[ab.cardId] % threshold === 0) wp.cardLevels[ab.cardId] = (wp.cardLevels[ab.cardId] || 1) + 1;
         saveData();
         return interaction.channel.send({ embeds: [new EmbedBuilder().setTitle(`${arena.emoji} Arena Conquered!`).setDescription(`👑 **${ab.userName}** defeated **${arena.guardian.name}** and claimed **${arena.name}**! +${gemGain}💎\n${prevHolder ? `*${prevHolder} lost the arena.*` : '*First claim ever!*'}`).setColor(0xf1c40f)] });
       }
