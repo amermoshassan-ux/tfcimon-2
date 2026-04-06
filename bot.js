@@ -1,10 +1,50 @@
-// TFCImon Discord Bot — MEGA UPDATE
+// TFCImon Discord Bot — MEGA UPDATE + PERSISTENT STORAGE
 require('dotenv').config();
 const { Client, GatewayIntentBits, SlashCommandBuilder, EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, REST, Routes } = require('discord.js');
+const fs = require('fs');
+const path = require('path');
 
 const BOT_TOKEN = process.env.BOT_TOKEN || 'YOUR_BOT_TOKEN_HERE';
 const CLIENT_ID = process.env.CLIENT_ID || 'YOUR_CLIENT_ID_HERE';
 const OP_USER = 'haxiii7';
+
+// ─── PERSISTENT STORAGE ───────────────────────────────────────────────────────
+// All data is saved to data.json — survives bot restarts and updates!
+
+const DATA_FILE = path.join(__dirname, 'data.json');
+
+function loadData() {
+  try {
+    if (fs.existsSync(DATA_FILE)) {
+      const raw = fs.readFileSync(DATA_FILE, 'utf8');
+      return JSON.parse(raw);
+    }
+  } catch (e) {
+    console.error('Failed to load data.json, starting fresh:', e.message);
+  }
+  return { players: {}, arenas: {}, auctionListings: {}, listingCounter: 1, doubleGemsEvent: false };
+}
+
+function saveData() {
+  try {
+    const data = {
+      players: Object.fromEntries(playerData),
+      arenas: Object.fromEntries(
+        Object.entries(ARENAS).map(([id, a]) => [id, { holder: a.holder, holderName: a.holderName }])
+      ),
+      auctionListings: Object.fromEntries(auctionListings),
+      listingCounter,
+      doubleGemsEvent,
+    };
+    fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2));
+  } catch (e) {
+    console.error('Failed to save data.json:', e.message);
+  }
+}
+
+// Auto-save every 60 seconds as a safety net
+setInterval(saveData, 60_000);
+
 // ─── CARD DATA ────────────────────────────────────────────────────────────────
 
 const CARDS = {
@@ -50,7 +90,6 @@ const CARDS = {
       { name: 'Tuff Stuff', damage: 170, cost: 5, emoji: '💪' },
     ],
   },
-  // ── NEW CARDS ──
   shadowfox: {
     id: 'shadowfox', name: 'Shadow Fox', hp: 220, type: 'Shadow', rarity: 'Rare', emoji: '🦊', color: 0x6c3483,
     description: 'A cunning fox that strikes from the darkness.', gemCost: 350,
@@ -107,6 +146,9 @@ const PACK_WEIGHTS = {
 };
 
 const PACK_GEM_COST = 150;
+
+// Sell-back value = 30% of gem cost
+const SELL_BACK_RATE = 0.3;
 
 const ALL_CARD_CHOICES = Object.values(CARDS).map(c => ({ name: `${c.emoji} ${c.name} (${c.gemCost}💎) — ${c.rarity}`, value: c.id }));
 
@@ -178,17 +220,38 @@ const ARENAS = {
   },
 };
 
-// ─── STORAGE ──────────────────────────────────────────────────────────────────
+// ─── LOAD SAVED DATA ──────────────────────────────────────────────────────────
 
-const playerData = new Map();
+const savedData = loadData();
+
+// Restore players
+const playerData = new Map(Object.entries(savedData.players || {}));
+
+// Restore arena holders
+for (const [arenaId, arenaState] of Object.entries(savedData.arenas || {})) {
+  if (ARENAS[arenaId]) {
+    ARENAS[arenaId].holder = arenaState.holder || null;
+    ARENAS[arenaId].holderName = arenaState.holderName || null;
+  }
+}
+
+// Restore auction listings
+const auctionListings = new Map(
+  Object.entries(savedData.auctionListings || {}).map(([k, v]) => [parseInt(k), v])
+);
+let listingCounter = savedData.listingCounter || 1;
+let doubleGemsEvent = savedData.doubleGemsEvent || false;
+
+// In-memory only (active battles reset on restart — that's fine)
 const activeBattles = new Map();
 const activeArenaBattles = new Map();
-const auctionListings = new Map();
 const tradeOffers = new Map();
 const activeTournament = { running: false, players: [], bracket: [], currentMatch: null };
-let listingCounter = 1;
 let tradeCounter = 1;
-let doubleGemsEvent = false;
+
+console.log(`✅ Loaded ${playerData.size} players, ${auctionListings.size} AH listings from data.json`);
+
+// ─── PLAYER HELPERS ───────────────────────────────────────────────────────────
 
 function getPlayer(userId) {
   if (!playerData.has(userId)) {
@@ -215,7 +278,7 @@ function getCardLevel(player, cardId) {
 }
 
 function getLevelBonus(level) {
-  return (level - 1) * 10; // +10 damage per level
+  return (level - 1) * 10;
 }
 
 // ─── HELPERS ──────────────────────────────────────────────────────────────────
@@ -253,14 +316,14 @@ function isOp(interaction) { return interaction.user.username === OP_USER; }
 
 function gemMultiplier() { return doubleGemsEvent ? 2 : 1; }
 
-function buildDeckEmbed(userId, player) {
+function buildDeckEmbed(userId, player, displayName) {
   const embed = new EmbedBuilder()
-    .setTitle('📦 Your TFCImon Deck')
+    .setTitle(`📦 ${displayName}'s TFCImon Deck`)
     .setColor(0x9b59b6)
     .setFooter({ text: `💎 ${player.gems} gems | ⚡ ${player.energyCards} energy cards | ⚔️ ${player.wins}W ${player.losses}L` });
 
   if (player.deck.length === 0) {
-    embed.setDescription('Your deck is empty! Use `/openpack` to get cards.');
+    embed.setDescription('Deck is empty! Use `/openpack` to get cards.');
     return embed;
   }
 
@@ -297,12 +360,28 @@ const ARENA_CHOICES = [
 const commands = [
   new SlashCommandBuilder().setName('openpack').setDescription('Open a TFCImon pack and get 3 cards!').toJSON(),
   new SlashCommandBuilder().setName('deck').setDescription('View your TFCImon card deck').toJSON(),
+
+  // NEW: View another player's deck
+  new SlashCommandBuilder()
+    .setName('inspect')
+    .setDescription("View another player's deck")
+    .addUserOption(opt => opt.setName('user').setDescription('Player to inspect').setRequired(true))
+    .toJSON(),
+
   new SlashCommandBuilder().setName('gems').setDescription('Check your gem balance').toJSON(),
   new SlashCommandBuilder().setName('shop').setDescription('View the gem shop').toJSON(),
   new SlashCommandBuilder().setName('daily').setDescription('Claim your daily gem reward!').toJSON(),
   new SlashCommandBuilder().setName('leaderboard').setDescription('View the TFCImon leaderboard').toJSON(),
+  new SlashCommandBuilder().setName('top').setDescription('Shortcut: View the TFCImon leaderboard').toJSON(),
   new SlashCommandBuilder().setName('stats').setDescription('View your battle stats').toJSON(),
   new SlashCommandBuilder().setName('arenas').setDescription('View all TFCImon arenas and holders').toJSON(),
+
+  // NEW: Sell a card back for gems
+  new SlashCommandBuilder()
+    .setName('sell')
+    .setDescription(`Sell a card back for ${Math.round(SELL_BACK_RATE * 100)}% of its gem buy price`)
+    .addStringOption(opt => opt.setName('card').setDescription('Card to sell').setRequired(true).addChoices(...ALL_CARD_CHOICES.slice(0, 25)))
+    .toJSON(),
 
   new SlashCommandBuilder()
     .setName('buycard')
@@ -352,7 +431,6 @@ const commands = [
     .addStringOption(opt => opt.setName('youget').setDescription('Card you want').setRequired(true).addChoices(...ALL_CARD_CHOICES.slice(0, 25)))
     .toJSON(),
 
-  // Auction House
   new SlashCommandBuilder().setName('ah').setDescription('Browse the auction house').toJSON(),
 
   new SlashCommandBuilder()
@@ -444,6 +522,10 @@ client.once('ready', () => {
   client.user.setActivity('TFCImon — /openpack to start!');
 });
 
+// Graceful shutdown — save before exiting
+process.on('SIGINT', () => { saveData(); console.log('💾 Data saved. Goodbye!'); process.exit(0); });
+process.on('SIGTERM', () => { saveData(); process.exit(0); });
+
 // ─── INTERACTIONS ─────────────────────────────────────────────────────────────
 
 client.on('interactionCreate', async (interaction) => {
@@ -463,6 +545,7 @@ client.on('interactionCreate', async (interaction) => {
       }
       const earned = 10 * gemMultiplier();
       player.gems += earned;
+      saveData();
 
       const embed = new EmbedBuilder()
         .setTitle('📦 Pack Opened!')
@@ -482,12 +565,19 @@ client.on('interactionCreate', async (interaction) => {
 
     // ── /deck ──
     else if (commandName === 'deck') {
-      await interaction.reply({ embeds: [buildDeckEmbed(userId, player)] });
+      await interaction.reply({ embeds: [buildDeckEmbed(userId, player, interaction.user.displayName)] });
+    }
+
+    // ── /inspect ── NEW: peek at another player's deck
+    else if (commandName === 'inspect') {
+      const target = interaction.options.getUser('user');
+      const tp = getPlayer(target.id);
+      await interaction.reply({ embeds: [buildDeckEmbed(target.id, tp, target.displayName)] });
     }
 
     // ── /gems ──
     else if (commandName === 'gems') {
-      await interaction.reply({ embeds: [new EmbedBuilder().setTitle('💎 Your Gems').setDescription(`You have **${player.gems} gems**!\n\nEarn gems by:\n• Opening packs (+${10 * gemMultiplier()}💎)\n• Winning PvP battles (+${25 * gemMultiplier()}💎)\n• Conquering arenas (+${50 * gemMultiplier()}💎)\n• Daily reward (up to 200💎)\n• Gambling 🎰${doubleGemsEvent ? '\n\n🎉 **DOUBLE GEMS EVENT IS ACTIVE!**' : ''}`).setColor(0xf1c40f)] });
+      await interaction.reply({ embeds: [new EmbedBuilder().setTitle('💎 Your Gems').setDescription(`You have **${player.gems} gems**!\n\nEarn gems by:\n• Opening packs (+${10 * gemMultiplier()}💎)\n• Winning PvP battles (+${25 * gemMultiplier()}💎)\n• Conquering arenas (+${50 * gemMultiplier()}💎)\n• Daily reward (up to 200💎)\n• Gambling 🎰\n• Selling cards 💰${doubleGemsEvent ? '\n\n🎉 **DOUBLE GEMS EVENT IS ACTIVE!**' : ''}`).setColor(0xf1c40f)] });
     }
 
     // ── /daily ──
@@ -500,15 +590,16 @@ client.on('interactionCreate', async (interaction) => {
         const mins = Math.floor((remaining % 3600000) / 60000);
         return interaction.reply({ content: `⏰ Daily reward not ready yet! Come back in **${hours}h ${mins}m**.`, ephemeral: true });
       }
-      const reward = Math.floor(Math.random() * 151) + 50; // 50-200 gems
+      const reward = Math.floor(Math.random() * 151) + 50;
       const total = reward * gemMultiplier();
       player.gems += total;
       player.lastDaily = now;
+      saveData();
       await interaction.reply({ embeds: [new EmbedBuilder().setTitle('🎁 Daily Reward!').setDescription(`You claimed your daily reward!\n\n+**${total}💎 gems**${doubleGemsEvent ? ' (×2 event!)' : ''}\n\nTotal: **${player.gems}💎**`).setColor(0x00b894)] });
     }
 
-    // ── /leaderboard ──
-    else if (commandName === 'leaderboard') {
+    // ── /leaderboard + /top ──
+    else if (commandName === 'leaderboard' || commandName === 'top') {
       const players = [...playerData.entries()].map(([id, p]) => ({ id, ...p }));
       const byWins = [...players].sort((a, b) => (b.wins || 0) - (a.wins || 0)).slice(0, 5);
       const byGems = [...players].sort((a, b) => (b.gems || 0) - (a.gems || 0)).slice(0, 5);
@@ -524,7 +615,6 @@ client.on('interactionCreate', async (interaction) => {
         { name: '💎 Top Gem Holders', value: gemsText },
       );
 
-      // Arena holders
       const holders = Object.values(ARENAS).filter(a => a.holder).map(a => `${a.emoji} **${a.name}** → ${a.holderName}`).join('\n');
       if (holders) embed.addFields({ name: '🏟️ Arena Holders', value: holders });
 
@@ -543,7 +633,6 @@ client.on('interactionCreate', async (interaction) => {
           { name: '⚡ Energy Cards', value: `${player.energyCards}`, inline: true },
         );
 
-      // Best card
       if (Object.keys(player.cardWins).length > 0) {
         const bestCardId = Object.entries(player.cardWins).sort((a, b) => b[1] - a[1])[0][0];
         const bestCard = CARDS[bestCardId];
@@ -553,7 +642,6 @@ client.on('interactionCreate', async (interaction) => {
         }
       }
 
-      // Card levels
       const leveled = Object.entries(player.cardLevels).filter(([, lv]) => lv > 1).map(([id, lv]) => {
         const card = CARDS[id];
         return card ? `${card.emoji} ${card.name}: Lv${lv}` : null;
@@ -567,7 +655,7 @@ client.on('interactionCreate', async (interaction) => {
     else if (commandName === 'shop') {
       const embed = new EmbedBuilder()
         .setTitle('🛒 TFCImon Gem Shop')
-        .setDescription(`Your balance: **${player.gems}💎**${doubleGemsEvent ? '\n🎉 **DOUBLE GEMS EVENT ACTIVE!**' : ''}`)
+        .setDescription(`Your balance: **${player.gems}💎**\nSell unwanted cards back with \`/sell\` for ${Math.round(SELL_BACK_RATE * 100)}% of buy price.${doubleGemsEvent ? '\n🎉 **DOUBLE GEMS EVENT ACTIVE!**' : ''}`)
         .setColor(0xf1c40f)
         .addFields({ name: '📦 Pack (150💎)', value: '3 random cards — `/buypack`' });
 
@@ -577,12 +665,32 @@ client.on('interactionCreate', async (interaction) => {
       await interaction.reply({ embeds: [embed] });
     }
 
+    // ── /sell ── NEW: sell a card back for a fraction of its gem cost
+    else if (commandName === 'sell') {
+      const cardId = interaction.options.getString('card');
+      const card = CARDS[cardId];
+      if (!card) return interaction.reply({ content: '❌ Card not found.', ephemeral: true });
+      if (!player.deck.includes(cardId)) return interaction.reply({ content: `❌ You don't have **${card.name}** in your deck!`, ephemeral: true });
+
+      const sellValue = Math.round(card.gemCost * SELL_BACK_RATE);
+      player.deck.splice(player.deck.indexOf(cardId), 1);
+      player.gems += sellValue;
+      saveData();
+
+      await interaction.reply({ embeds: [new EmbedBuilder()
+        .setTitle('💰 Card Sold!')
+        .setDescription(`Sold ${card.emoji} **${card.name}** for **${sellValue}💎**!\n*(${Math.round(SELL_BACK_RATE * 100)}% of ${card.gemCost}💎 buy price)*\n\nNew balance: **${player.gems}💎**`)
+        .setColor(0x00b894)
+      ] });
+    }
+
     // ── /buypack ──
     else if (commandName === 'buypack') {
       if (player.gems < PACK_GEM_COST) return interaction.reply({ content: `❌ Need ${PACK_GEM_COST}💎, you have ${player.gems}💎.`, ephemeral: true });
       player.gems -= PACK_GEM_COST;
       const pulled = openPack(3);
       for (const id of pulled) id === 'energy' ? player.energyCards++ : player.deck.push(id);
+      saveData();
       const embed = new EmbedBuilder().setTitle('🛒 Pack Purchased!').setColor(0xf39c12).setFooter({ text: `Remaining: ${player.gems}💎` });
       embed.addFields({ name: '🎴 You got:', value: pulled.map((id, i) => id === 'energy' ? `**${i+1}:** ⚡ Energy Card` : `**${i+1}:** ${CARDS[id].emoji} **${CARDS[id].name}**`).join('\n') });
       await interaction.reply({ embeds: [embed] });
@@ -596,6 +704,7 @@ client.on('interactionCreate', async (interaction) => {
       if (player.gems < card.gemCost) return interaction.reply({ content: `❌ Need ${card.gemCost}💎, you have ${player.gems}💎.`, ephemeral: true });
       player.gems -= card.gemCost;
       player.deck.push(cardId);
+      saveData();
       await interaction.reply({ embeds: [new EmbedBuilder().setTitle('🛒 Card Purchased!').setDescription(`${card.emoji} **${card.name}** added to your deck!`).setColor(card.color).setFooter({ text: `Remaining: ${player.gems}💎` })] });
     }
 
@@ -605,6 +714,7 @@ client.on('interactionCreate', async (interaction) => {
       const nickname = interaction.options.getString('nickname');
       if (!player.deck.includes(cardId)) return interaction.reply({ content: `❌ You don't have ${CARDS[cardId]?.name || cardId} in your deck!`, ephemeral: true });
       player.nicknames[cardId] = nickname;
+      saveData();
       const card = CARDS[cardId];
       await interaction.reply({ embeds: [new EmbedBuilder().setTitle('✏️ Nickname Set!').setDescription(`${card.emoji} **${card.name}** is now *"${nickname}"*!`).setColor(card.color)] });
     }
@@ -615,23 +725,20 @@ client.on('interactionCreate', async (interaction) => {
       if (player.gems < amount) return interaction.reply({ content: `❌ You only have ${player.gems}💎!`, ephemeral: true });
 
       const roll = Math.random();
-      let result, gained;
+      let result;
 
       if (roll < 0.45) {
-        // Win — double
-        gained = amount;
-        player.gems += gained;
-        result = `🎰 **YOU WIN!** +${gained}💎\nBalance: **${player.gems}💎**`;
+        player.gems += amount;
+        result = `🎰 **YOU WIN!** +${amount}💎\nBalance: **${player.gems}💎**`;
       } else if (roll < 0.55) {
-        // Push — get back half
-        gained = Math.floor(amount / 2);
-        player.gems -= gained;
-        result = `🎰 **PUSH!** You get back half. -${gained}💎\nBalance: **${player.gems}💎**`;
+        const lost = Math.floor(amount / 2);
+        player.gems -= lost;
+        result = `🎰 **PUSH!** You get back half. -${lost}💎\nBalance: **${player.gems}💎**`;
       } else {
-        // Lose
         player.gems -= amount;
         result = `🎰 **YOU LOSE!** -${amount}💎\nBalance: **${player.gems}💎**`;
       }
+      saveData();
 
       const embed = new EmbedBuilder().setTitle('🎰 Gem Gamble!').setDescription(`You bet **${amount}💎**\n\n${result}`).setColor(roll < 0.45 ? 0x00b894 : roll < 0.55 ? 0xf39c12 : 0xe74c3c);
       await interaction.reply({ embeds: [embed] });
@@ -648,6 +755,7 @@ client.on('interactionCreate', async (interaction) => {
       player.deck.splice(player.deck.indexOf(cardId), 1);
       const tp = getPlayer(target.id);
       tp.deck.push(cardId);
+      saveData();
 
       await interaction.reply({ embeds: [new EmbedBuilder().setTitle('🎁 Card Gifted!').setDescription(`${interaction.user.displayName} gifted ${card.emoji} **${card.name}** to **${target.displayName}**!`).setColor(0x00b894)] });
     }
@@ -775,14 +883,12 @@ client.on('interactionCreate', async (interaction) => {
         const bidInfo = l.bidPrice ? `\n🏷️ Bid: ${l.currentBid || l.bidPrice}💎 (${l.highestBidderName || 'nobody'})` : '';
         embed.addFields({ name: `#${l.id} ${card?.emoji} ${card?.name} — ${l.sellerName}`, value: `💰 Buy Now: **${l.price}💎**${bidInfo}` });
       }
-      const rows = [];
       const buyRow = new ActionRowBuilder();
       for (const l of listings.slice(0, 5)) {
         const card = CARDS[l.cardId];
         buyRow.addComponents(new ButtonBuilder().setCustomId(`ah_buy_${l.id}`).setLabel(`Buy #${l.id} ${card?.emoji || ''}`).setStyle(ButtonStyle.Success));
       }
-      rows.push(buyRow);
-      await interaction.reply({ embeds: [embed], components: rows });
+      await interaction.reply({ embeds: [embed], components: [buyRow] });
     }
 
     // ── /ah-sell ──
@@ -794,6 +900,7 @@ client.on('interactionCreate', async (interaction) => {
       player.deck.splice(player.deck.indexOf(cardId), 1);
       const id = listingCounter++;
       auctionListings.set(id, { id, sellerId: userId, sellerName: interaction.user.displayName, cardId, price, bidPrice: bidStart || null, currentBid: null, highestBidder: null, highestBidderName: null });
+      saveData();
       const card = CARDS[cardId];
       await interaction.reply({ embeds: [new EmbedBuilder().setTitle('🏪 Card Listed!').setDescription(`${card?.emoji} **${card?.name}** listed!\n💰 Buy Now: **${price}💎**${bidStart ? `\n🏷️ Bidding from: **${bidStart}💎**` : ''}`).setColor(0xe17055)] });
     }
@@ -841,6 +948,7 @@ client.on('interactionCreate', async (interaction) => {
       const newId = `custom_${Date.now()}`;
       CARDS[newId] = { id: newId, name, hp, type, rarity, emoji: '🃏', color: 0x6c5ce7, description: `Custom card by ${interaction.user.displayName}.`, gemCost: 9999, moves: [{ name: m1, damage: m1d, cost: 2, emoji: '⚔️' }, { name: m2, damage: m2d, cost: 4, emoji: '💥' }] };
       if (giveToUser) getPlayer(giveToUser.id).deck.push(newId);
+      saveData();
       await interaction.reply({ embeds: [new EmbedBuilder().setTitle('🃏 Custom Card Created!').setDescription(`**${name}** — ${hp}HP | ${type} | ${rarity}\n⚔️ ${m1}: ${m1d}dmg\n💥 ${m2}: ${m2d}dmg${giveToUser ? `\nGiven to **${giveToUser.displayName}**!` : ''}`).setColor(0x6c5ce7)] });
     }
 
@@ -848,6 +956,7 @@ client.on('interactionCreate', async (interaction) => {
       if (!isOp(interaction)) return interaction.reply({ content: '❌ No permission.', ephemeral: true });
       const target = interaction.options.getUser('user'); const amount = interaction.options.getInteger('amount');
       const tp = getPlayer(target.id); tp.gems += amount;
+      saveData();
       await interaction.reply({ embeds: [new EmbedBuilder().setTitle('💎 Gems Given!').setDescription(`Gave **${amount}💎** to **${target.displayName}**! They now have **${tp.gems}💎**.`).setColor(0xf1c40f)] });
     }
 
@@ -855,6 +964,7 @@ client.on('interactionCreate', async (interaction) => {
       if (!isOp(interaction)) return interaction.reply({ content: '❌ No permission.', ephemeral: true });
       const target = interaction.options.getUser('user'); const cardId = interaction.options.getString('card');
       const tp = getPlayer(target.id); tp.deck.push(cardId);
+      saveData();
       const card = CARDS[cardId];
       await interaction.reply({ embeds: [new EmbedBuilder().setTitle('🎴 Card Given!').setDescription(`Gave ${card?.emoji} **${card?.name}** to **${target.displayName}**!`).setColor(card?.color || 0x9b59b6)] });
     }
@@ -863,6 +973,7 @@ client.on('interactionCreate', async (interaction) => {
       if (!isOp(interaction)) return interaction.reply({ content: '❌ No permission.', ephemeral: true });
       const target = interaction.options.getUser('user');
       const tp = getPlayer(target.id); tp.deck = []; tp.energyCards = 0;
+      saveData();
       await interaction.reply({ embeds: [new EmbedBuilder().setTitle('💀 Player Wiped!').setDescription(`**${target.displayName}**'s deck wiped. 💀`).setColor(0xe74c3c)] });
     }
 
@@ -870,6 +981,7 @@ client.on('interactionCreate', async (interaction) => {
       if (!isOp(interaction)) return interaction.reply({ content: '❌ No permission.', ephemeral: true });
       const arenaId = interaction.options.getString('arena');
       const arena = ARENAS[arenaId]; arena.holder = null; arena.holderName = null;
+      saveData();
       await interaction.reply({ embeds: [new EmbedBuilder().setTitle('🏟️ Arena Reset!').setDescription(`**${arena.name}** is unclaimed again!`).setColor(arena.color)] });
     }
 
@@ -882,6 +994,7 @@ client.on('interactionCreate', async (interaction) => {
     else if (commandName === 'doublegems') {
       if (!isOp(interaction)) return interaction.reply({ content: '❌ No permission.', ephemeral: true });
       doubleGemsEvent = !doubleGemsEvent;
+      saveData();
       await interaction.reply({ embeds: [new EmbedBuilder().setTitle(doubleGemsEvent ? '🎉 Double Gems Event STARTED!' : '⏹️ Double Gems Event ENDED!').setDescription(doubleGemsEvent ? 'All gem rewards are doubled until further notice!' : 'Gem rewards are back to normal.').setColor(doubleGemsEvent ? 0xf1c40f : 0x636e72)] });
     }
 
@@ -895,7 +1008,6 @@ client.on('interactionCreate', async (interaction) => {
         activeTournament.running = true; activeTournament.players = []; activeTournament.bracket = [];
         return interaction.reply({ embeds: [new EmbedBuilder().setTitle('🏆 Tournament Open!').setDescription('A TFCImon tournament is starting! Use `/jointournament` to enter!\n\nOP will start the bracket when enough players have joined.').setColor(0xf1c40f)] });
       }
-      // Start bracket
       const shuffled = [...activeTournament.players].sort(() => Math.random() - 0.5);
       activeTournament.bracket = shuffled;
       const matchups = [];
@@ -942,6 +1054,7 @@ client.on('interactionCreate', async (interaction) => {
       fromPlayer.deck.push(trade.wantId);
       toPlayer.deck.push(trade.giveId);
       tradeOffers.delete(tradeId);
+      saveData();
 
       const gCard = CARDS[trade.giveId]; const wCard = CARDS[trade.wantId];
       await interaction.update({ embeds: [new EmbedBuilder().setTitle('🔄 Trade Complete!').setDescription(`**${trade.fromName}** got ${wCard.emoji} **${wCard.name}**\n**${trade.toName}** got ${gCard.emoji} **${gCard.name}**`).setColor(0x00b894)], components: [] });
@@ -959,6 +1072,7 @@ client.on('interactionCreate', async (interaction) => {
       player.deck.push(listing.cardId);
       getPlayer(listing.sellerId).gems += listing.price;
       auctionListings.delete(listingId);
+      saveData();
 
       const card = CARDS[listing.cardId];
       await interaction.reply({ embeds: [new EmbedBuilder().setTitle('🏪 Purchase Complete!').setDescription(`${card?.emoji} **${card?.name}** bought for **${listing.price}💎**!`).setColor(0x00b894)] });
@@ -975,6 +1089,7 @@ client.on('interactionCreate', async (interaction) => {
       if (listing.highestBidder) getPlayer(listing.highestBidder).gems += listing.currentBid;
       player.gems -= minBid;
       listing.currentBid = minBid; listing.highestBidder = userId; listing.highestBidderName = interaction.user.displayName;
+      saveData();
       await interaction.reply({ embeds: [new EmbedBuilder().setTitle('🏷️ Bid Placed!').setDescription(`You bid **${minBid}💎** — you're the highest bidder!`).setColor(0x6c5ce7)] });
     }
 
@@ -1028,16 +1143,15 @@ client.on('interactionCreate', async (interaction) => {
         atkPlayer.cardWins[attacker.cardId] = (atkPlayer.cardWins[attacker.cardId] || 0) + 1;
         defPlayer.losses++;
         defPlayer.cardLosses[defender.cardId] = (defPlayer.cardLosses[defender.cardId] || 0) + 1;
-        // Level up card every 3 wins
         const cWins = atkPlayer.cardWins[attacker.cardId];
         if (cWins % 3 === 0) {
           atkPlayer.cardLevels[attacker.cardId] = (atkPlayer.cardLevels[attacker.cardId] || 1) + 1;
         }
         const lvlMsg = cWins % 3 === 0 ? `\n⬆️ **${aCard.name}** leveled up to Lv${atkPlayer.cardLevels[attacker.cardId]}!` : '';
+        saveData();
         return interaction.channel.send({ embeds: [new EmbedBuilder().setTitle('🏆 Battle Over!').setDescription(`**${attacker.name}** wins! +${gemGain}💎${lvlMsg}\n${move.emoji} **${move.name}** dealt **${totalDmg}** as the finishing blow!`).setColor(0xf1c40f)] });
       }
 
-      const dCard = CARDS[defender.cardId];
       await sendBattleState(interaction.channel, battle, CARDS[battle.challenger.cardId], CARDS[battle.opponent.cardId], battleId,
         `${move.emoji} **${attacker.name}** used **${move.name}** → **${totalDmg}** damage!${bonus > 0 ? ` *(+${bonus} level bonus)*` : ''}`);
     }
@@ -1074,6 +1188,7 @@ client.on('interactionCreate', async (interaction) => {
         const wp = getPlayer(ab.userId); wp.gems += gemGain; wp.wins++;
         wp.cardWins[ab.cardId] = (wp.cardWins[ab.cardId] || 0) + 1;
         if (wp.cardWins[ab.cardId] % 3 === 0) wp.cardLevels[ab.cardId] = (wp.cardLevels[ab.cardId] || 1) + 1;
+        saveData();
         return interaction.channel.send({ embeds: [new EmbedBuilder().setTitle(`${arena.emoji} Arena Conquered!`).setDescription(`👑 **${ab.userName}** defeated **${arena.guardian.name}** and claimed **${arena.name}**! +${gemGain}💎\n${prevHolder ? `*${prevHolder} lost the arena.*` : '*First claim ever!*'}`).setColor(0xf1c40f)] });
       }
 
@@ -1087,6 +1202,7 @@ client.on('interactionCreate', async (interaction) => {
       if (ab.playerHp <= 0) {
         activeArenaBattles.delete(battleId);
         const lp = getPlayer(ab.userId); lp.losses++;
+        saveData();
         return interaction.channel.send({ embeds: [new EmbedBuilder().setTitle(`${arena.emoji} Defeated!`).setDescription(`💀 **${ab.userName}** was defeated by **${arena.guardian.name}**!`).setColor(0xe74c3c)] });
       }
 
