@@ -21,7 +21,7 @@ function loadData() {
   } catch (e) {
     console.error('Failed to load data.json:', e.message);
   }
-  return { players: {}, arenas: {}, auctionListings: {}, listingCounter: 1, doubleGemsEvent: false, customCards: {}, opUsers: [] };
+  return { players: {}, arenas: {}, auctionListings: {}, listingCounter: 1, doubleGemsEvent: false, customCards: {}, opUsers: [], bounties: {}, bannedUsers: [] };
 }
 
 function saveData() {
@@ -34,6 +34,8 @@ function saveData() {
       doubleGemsEvent,
       customCards: Object.fromEntries(Object.entries(CARDS).filter(([id]) => id.startsWith('custom_'))),
       opUsers,
+      bounties: Object.fromEntries(bounties),
+      bannedUsers,
     };
     fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2));
   } catch (e) {
@@ -228,7 +230,6 @@ for (const [arenaId, arenaState] of Object.entries(savedData.arenas || {})) {
   }
 }
 
-// Restore custom cards from disk
 for (const [id, card] of Object.entries(savedData.customCards || {})) {
   CARDS[id] = card;
 }
@@ -237,21 +238,24 @@ const auctionListings = new Map(Object.entries(savedData.auctionListings || {}).
 let listingCounter = savedData.listingCounter || 1;
 let doubleGemsEvent = savedData.doubleGemsEvent || false;
 let opUsers = savedData.opUsers || [];
+// bounties: Map<targetUserId, { amount, setBy, setByName, targetName }>
+const bounties = new Map(Object.entries(savedData.bounties || {}));
+let bannedUsers = savedData.bannedUsers || [];
 
 const activeBattles = new Map();
 const activeArenaBattles = new Map();
 const tradeOffers = new Map();
 const activeTournament = { running: false, players: [], bracket: [] };
-const buildDeckSessions = new Map(); // userId -> { selected: [] }
+const buildDeckSessions = new Map();
 let tradeCounter = 1;
 
-console.log(`✅ Loaded ${playerData.size} players, ${auctionListings.size} AH listings, ${Object.keys(savedData.customCards || {}).length} custom cards`);
+console.log(`✅ Loaded ${playerData.size} players, ${auctionListings.size} AH listings, ${Object.keys(savedData.customCards || {}).length} custom cards, ${bounties.size} bounties`);
 
 // ─── HELPERS ──────────────────────────────────────────────────────────────────
 
 function getPlayer(userId) {
   if (!playerData.has(userId)) {
-    playerData.set(userId, { deck: [], activeDeck: [], energyCards: 0, gems: 100, nicknames: {}, wins: 0, losses: 0, cardWins: {}, cardLosses: {}, cardLevels: {}, lastDaily: null, totalBattles: 0 });
+    playerData.set(userId, { deck: [], activeDeck: [], energyCards: 0, gems: 100, nicknames: {}, wins: 0, losses: 0, cardWins: {}, cardLosses: {}, cardLevels: {}, lastDaily: null, totalBattles: 0, banned: false });
   }
   const p = playerData.get(userId);
   if (!p.wins) p.wins = 0;
@@ -263,7 +267,12 @@ function getPlayer(userId) {
   if (!p.totalBattles) p.totalBattles = 0;
   if (!p.nicknames) p.nicknames = {};
   if (!p.activeDeck) p.activeDeck = [];
+  if (p.banned === undefined) p.banned = false;
   return p;
+}
+
+function isBanned(userId) {
+  return bannedUsers.includes(userId);
 }
 
 function getCardLevel(player, cardId) { return player.cardLevels[cardId] || 1; }
@@ -301,7 +310,6 @@ function isOp(interaction) {
 
 function gemMultiplier() { return doubleGemsEvent ? 2 : 1; }
 
-// Get the card a player will use in battle (from activeDeck if set, else random from deck)
 function getBattleCard(player) {
   if (player.activeDeck && player.activeDeck.length > 0) {
     const valid = player.activeDeck.filter(id => player.deck.includes(id) && CARDS[id]);
@@ -341,6 +349,13 @@ function buildDeckEmbed(userId, player, displayName) {
     const activeNames = player.activeDeck.map(id => CARDS[id]?.name || id).join(', ');
     embed.addFields({ name: '🎯 Active Battle Deck', value: activeNames });
   }
+
+  // Show bounty on this player if one exists
+  if (bounties.has(userId)) {
+    const b = bounties.get(userId);
+    embed.addFields({ name: '🎯 BOUNTY', value: `**${b.amount}💎** — set by ${b.setByName}` });
+  }
+
   embed.addFields({ name: '🃏 Total Cards', value: `${player.deck.length}`, inline: true });
   return embed;
 }
@@ -360,6 +375,34 @@ function buildCardInfoEmbed(card) {
   const movesText = card.moves.map(m => `${m.emoji} **${m.name}** — ${m.damage} dmg | Cost: ${m.cost}⚡${m.isEx ? ' ✨EX' : ''}`).join('\n');
   embed.addFields({ name: '⚔️ Moves', value: movesText });
   return embed;
+}
+
+// ─── SLOT MACHINE ─────────────────────────────────────────────────────────────
+
+const SLOT_SYMBOLS = ['🍋', '🍒', '🔔', '⭐', '💎', '7️⃣'];
+const SLOT_PAYOUTS = {
+  '💎💎💎': 20,
+  '7️⃣7️⃣7️⃣': 15,
+  '⭐⭐⭐': 10,
+  '🔔🔔🔔': 7,
+  '🍒🍒🍒': 5,
+  '🍋🍋🍋': 4,
+  'pair': 1.5,
+};
+
+function spinSlots() {
+  return [
+    SLOT_SYMBOLS[Math.floor(Math.random() * SLOT_SYMBOLS.length)],
+    SLOT_SYMBOLS[Math.floor(Math.random() * SLOT_SYMBOLS.length)],
+    SLOT_SYMBOLS[Math.floor(Math.random() * SLOT_SYMBOLS.length)],
+  ];
+}
+
+function evalSlots(reels) {
+  const key = reels.join('');
+  if (SLOT_PAYOUTS[key]) return SLOT_PAYOUTS[key];
+  if (reels[0] === reels[1] || reels[1] === reels[2] || reels[0] === reels[2]) return SLOT_PAYOUTS['pair'];
+  return 0;
 }
 
 // ─── ARENA CHOICES ────────────────────────────────────────────────────────────
@@ -389,7 +432,7 @@ const commands = [
   new SlashCommandBuilder().setName('stats').setDescription('View your battle stats').toJSON(),
   new SlashCommandBuilder().setName('arenas').setDescription('View all arenas and holders').toJSON(),
 
-  new SlashCommandBuilder().setName('builddeck').setDescription('Choose up to 3 cards as your active battle deck (picked randomly from these)').toJSON(),
+  new SlashCommandBuilder().setName('builddeck').setDescription('Choose up to 3 cards as your active battle deck').toJSON(),
   new SlashCommandBuilder().setName('cleardeck').setDescription('Clear your active deck and go back to random card selection').toJSON(),
 
   new SlashCommandBuilder()
@@ -406,7 +449,6 @@ const commands = [
     ).toJSON(),
 
   new SlashCommandBuilder().setName('sell').setDescription(`Sell a card back for ${Math.round(SELL_BACK_RATE * 100)}% of its gem cost`).addStringOption(opt => opt.setName('card').setDescription('Card to sell').setRequired(true).addChoices(...getAllCardChoices())).toJSON(),
-  new SlashCommandBuilder().setName('buycard').setDescription('Buy a specific card with gems').addStringOption(opt => opt.setName('card').setDescription('Card to buy').setRequired(true).addChoices(...getAllCardChoices())).toJSON(),
   new SlashCommandBuilder().setName('buypack').setDescription(`Buy a pack for ${PACK_GEM_COST} gems`).toJSON(),
 
   new SlashCommandBuilder().setName('battle').setDescription('Challenge another member to a TFCImon battle!').addUserOption(opt => opt.setName('opponent').setDescription('The member to battle').setRequired(true)).toJSON(),
@@ -417,13 +459,35 @@ const commands = [
 
   new SlashCommandBuilder().setName('challenge').setDescription('Challenge an arena guardian!').addStringOption(opt => opt.setName('arena').setDescription('Which arena').setRequired(true).addChoices(...ARENA_CHOICES)).toJSON(),
 
-  new SlashCommandBuilder().setName('gamble').setDescription('Gamble gems for a chance to double them!').addIntegerOption(opt => opt.setName('amount').setDescription('Amount to gamble').setRequired(true).setMinValue(10)).toJSON(),
+  // ─── GAMBLING ───
+  new SlashCommandBuilder().setName('gamble').setDescription('Gamble gems (45% win, 10% push, 45% lose)').addIntegerOption(opt => opt.setName('amount').setDescription('Amount to gamble').setRequired(true).setMinValue(10)).toJSON(),
+
+  new SlashCommandBuilder().setName('coinflip').setDescription('Flip a coin — call it right and double your bet!')
+    .addIntegerOption(opt => opt.setName('amount').setDescription('Amount to bet').setRequired(true).setMinValue(5))
+    .addStringOption(opt => opt.setName('call').setDescription('Heads or tails?').setRequired(true).addChoices({ name: '🪙 Heads', value: 'heads' }, { name: '🔵 Tails', value: 'tails' })).toJSON(),
+
+  new SlashCommandBuilder().setName('slots').setDescription('Spin the slot machine! Match symbols to multiply your bet.')
+    .addIntegerOption(opt => opt.setName('amount').setDescription('Amount to bet').setRequired(true).setMinValue(10)).toJSON(),
+
+  new SlashCommandBuilder().setName('dice').setDescription('Roll dice against the house — roll higher to win!')
+    .addIntegerOption(opt => opt.setName('amount').setDescription('Amount to bet').setRequired(true).setMinValue(10))
+    .addStringOption(opt => opt.setName('mode').setDescription('Game mode').setRequired(true).addChoices(
+      { name: '🎲 Classic (1d6 vs house)', value: 'classic' },
+      { name: '🎲🎲 High Stakes (2d6, must beat 7)', value: 'highstakes' },
+      { name: '🃏 Lucky 21 (d20 + d6, must hit 21)', value: 'lucky21' },
+    )).toJSON(),
+
+  // ─── BOUNTIES ───
+  new SlashCommandBuilder().setName('bounties').setDescription('View all active bounties').toJSON(),
+
+  // ─── TRADE / GIFT ───
   new SlashCommandBuilder().setName('gift').setDescription('Gift a card to another player').addUserOption(opt => opt.setName('user').setDescription('Who to gift to').setRequired(true)).addStringOption(opt => opt.setName('card').setDescription('Card to gift').setRequired(true).addChoices(...getAllCardChoices())).toJSON(),
   new SlashCommandBuilder().setName('trade').setDescription('Offer a card trade to another player')
     .addUserOption(opt => opt.setName('user').setDescription('Who to trade with').setRequired(true))
     .addStringOption(opt => opt.setName('yougive').setDescription('Card you give').setRequired(true).addChoices(...getAllCardChoices()))
     .addStringOption(opt => opt.setName('youget').setDescription('Card you want').setRequired(true).addChoices(...getAllCardChoices())).toJSON(),
 
+  // ─── AUCTION HOUSE ───
   new SlashCommandBuilder().setName('ah').setDescription('Browse the auction house').toJSON(),
   new SlashCommandBuilder().setName('ah-sell').setDescription('List a card on the auction house')
     .addStringOption(opt => opt.setName('card').setDescription('Card to sell').setRequired(true).addChoices(...getAllCardChoices()))
@@ -433,7 +497,7 @@ const commands = [
 
   new SlashCommandBuilder().setName('jointournament').setDescription('Join the upcoming tournament!').toJSON(),
 
-  // ── OP COMMANDS ──
+  // ════ OP COMMANDS ════
   new SlashCommandBuilder().setName('op').setDescription('[OP] Grant another user OP permissions').addUserOption(opt => opt.setName('user').setDescription('User to grant OP').setRequired(true)).toJSON(),
 
   new SlashCommandBuilder().setName('makecard').setDescription('[OP] Create a custom card')
@@ -463,15 +527,60 @@ const commands = [
     .addStringOption(opt => opt.setName('emoji').setDescription('New emoji'))
     .toJSON(),
 
+  new SlashCommandBuilder().setName('setrarity').setDescription('[OP] Set the rarity of any card')
+    .addStringOption(opt => opt.setName('card').setDescription('Card ID').setRequired(true))
+    .addStringOption(opt => opt.setName('rarity').setDescription('New rarity').setRequired(true).addChoices(
+      { name: 'Common', value: 'Common' },
+      { name: 'Uncommon', value: 'Uncommon' },
+      { name: 'Rare', value: 'Rare' },
+      { name: 'EX', value: 'EX' },
+      { name: 'LEGENDARY', value: 'LEGENDARY' },
+    )).toJSON(),
+
+  new SlashCommandBuilder().setName('setgems').setDescription('[OP] Set a player\'s gems to an exact amount')
+    .addUserOption(opt => opt.setName('user').setDescription('Player').setRequired(true))
+    .addIntegerOption(opt => opt.setName('amount').setDescription('New gem amount').setRequired(true).setMinValue(0)).toJSON(),
+
   new SlashCommandBuilder().setName('givegems').setDescription('[OP] Give gems to a player').addUserOption(opt => opt.setName('user').setDescription('Player').setRequired(true)).addIntegerOption(opt => opt.setName('amount').setDescription('Amount').setRequired(true).setMinValue(1)).toJSON(),
   new SlashCommandBuilder().setName('takegems').setDescription('[OP] Take gems from a player').addUserOption(opt => opt.setName('user').setDescription('Player').setRequired(true)).addIntegerOption(opt => opt.setName('amount').setDescription('Amount').setRequired(true).setMinValue(1)).toJSON(),
   new SlashCommandBuilder().setName('givecard').setDescription('[OP] Give a card to a player').addUserOption(opt => opt.setName('user').setDescription('Player').setRequired(true)).addStringOption(opt => opt.setName('card').setDescription('Card').setRequired(true).addChoices(...getAllCardChoices())).toJSON(),
   new SlashCommandBuilder().setName('kill').setDescription('[OP] Wipe a player\'s deck').addUserOption(opt => opt.setName('user').setDescription('Player').setRequired(true)).toJSON(),
+
+  new SlashCommandBuilder().setName('wipeall').setDescription('[OP] ⚠️ Wipe ALL player data (full reset)').toJSON(),
+
+  new SlashCommandBuilder().setName('clonecard').setDescription('[OP] Clone a card and give the copy to a player')
+    .addStringOption(opt => opt.setName('card').setDescription('Card ID to clone').setRequired(true))
+    .addUserOption(opt => opt.setName('user').setDescription('Player to receive clone').setRequired(true)).toJSON(),
+
+  new SlashCommandBuilder().setName('banplayer').setDescription('[OP] Ban a player from using the bot')
+    .addUserOption(opt => opt.setName('user').setDescription('Player to ban').setRequired(true))
+    .addStringOption(opt => opt.setName('reason').setDescription('Ban reason (optional)')).toJSON(),
+
+  new SlashCommandBuilder().setName('unbanplayer').setDescription('[OP] Unban a player')
+    .addUserOption(opt => opt.setName('user').setDescription('Player to unban').setRequired(true)).toJSON(),
+
+  new SlashCommandBuilder().setName('setarenacholder').setDescription('[OP] Manually set the holder of an arena')
+    .addStringOption(opt => opt.setName('arena').setDescription('Arena').setRequired(true).addChoices(...ARENA_CHOICES))
+    .addUserOption(opt => opt.setName('user').setDescription('New holder').setRequired(true)).toJSON(),
+
+  new SlashCommandBuilder().setName('broadcast').setDescription('[OP] Send a fancy broadcast embed with title + message')
+    .addStringOption(opt => opt.setName('title').setDescription('Embed title').setRequired(true))
+    .addStringOption(opt => opt.setName('message').setDescription('Message body').setRequired(true))
+    .addStringOption(opt => opt.setName('color').setDescription('Hex color (e.g. ff0000)').setMaxLength(6)).toJSON(),
+
   new SlashCommandBuilder().setName('resetarena').setDescription('[OP] Reset an arena holder').addStringOption(opt => opt.setName('arena').setDescription('Arena').setRequired(true).addChoices(...ARENA_CHOICES)).toJSON(),
   new SlashCommandBuilder().setName('announce').setDescription('[OP] Send a TFCImon announcement').addStringOption(opt => opt.setName('message').setDescription('Message').setRequired(true)).toJSON(),
   new SlashCommandBuilder().setName('doublegems').setDescription('[OP] Toggle double gems event').toJSON(),
   new SlashCommandBuilder().setName('tournament').setDescription('[OP] Open/start a tournament').toJSON(),
   new SlashCommandBuilder().setName('listcards').setDescription('[OP] List all cards including custom ones').toJSON(),
+
+  // ─── BOUNTY (OP) ───
+  new SlashCommandBuilder().setName('setbounty').setDescription('[OP] Place a gem bounty on a player')
+    .addUserOption(opt => opt.setName('user').setDescription('Target player').setRequired(true))
+    .addIntegerOption(opt => opt.setName('amount').setDescription('Bounty gem reward').setRequired(true).setMinValue(50)).toJSON(),
+
+  new SlashCommandBuilder().setName('removebounty').setDescription('[OP] Remove a bounty from a player')
+    .addUserOption(opt => opt.setName('user').setDescription('Target player').setRequired(true)).toJSON(),
 ];
 
 // ─── REGISTER ─────────────────────────────────────────────────────────────────
@@ -501,10 +610,16 @@ process.on('SIGTERM', () => { saveData(); process.exit(0); });
 
 client.on('interactionCreate', async (interaction) => {
 
-  // ── SLASH COMMANDS ──
   if (interaction.isChatInputCommand()) {
     const { commandName } = interaction;
     const userId = interaction.user.id;
+
+    // Ban check (allow OP commands to pass through)
+    const opCommandsList = ['op','makecard','editcard','setrarity','setgems','givegems','takegems','givecard','kill','wipeall','clonecard','banplayer','unbanplayer','setarenacholder','broadcast','resetarena','announce','doublegems','tournament','listcards','setbounty','removebounty'];
+    if (isBanned(userId) && !opCommandsList.includes(commandName)) {
+      return interaction.reply({ content: '🚫 You are banned from TFCImon.', ephemeral: true });
+    }
+
     const player = getPlayer(userId);
 
     // /openpack
@@ -545,59 +660,46 @@ client.on('interactionCreate', async (interaction) => {
       await interaction.reply({ embeds: [buildCardInfoEmbed(card)] });
     }
 
-    // /builddeck — interactive card picker
+    // /builddeck
     else if (commandName === 'builddeck') {
       if (player.deck.length === 0) return interaction.reply({ content: '❌ You have no cards! Open packs first.', ephemeral: true });
-
       const uniqueIds = [...new Set(player.deck)].filter(id => CARDS[id]);
       if (uniqueIds.length === 0) return interaction.reply({ content: '❌ No valid cards found.', ephemeral: true });
-
       buildDeckSessions.set(userId, { selected: [] });
-
       const options = uniqueIds.slice(0, 25).map(id => {
-        const c = CARDS[id];
-        const lvl = getCardLevel(player, id);
+        const c = CARDS[id]; const lvl = getCardLevel(player, id);
         return { label: `${c.name} Lv${lvl}`, description: `${c.hp}HP | ${c.rarity} | ${c.type}`, value: id, emoji: c.emoji };
       });
-
       const select = new StringSelectMenuBuilder()
         .setCustomId(`builddeck_select_${userId}`)
         .setPlaceholder('Pick up to 3 cards for your active battle deck')
         .setMinValues(1).setMaxValues(Math.min(3, options.length))
         .addOptions(options);
-
-      const row = new ActionRowBuilder().addComponents(select);
-      await interaction.reply({ content: '🎯 **Build Your Active Deck**\nPick 1-3 cards. These will be the cards used in battles (picked randomly from your selection).', components: [row] });
+      await interaction.reply({ content: '🎯 **Build Your Active Deck**\nPick 1-3 cards. These will be the cards used in battles.', components: [new ActionRowBuilder().addComponents(select)] });
     }
 
     // /cleardeck
     else if (commandName === 'cleardeck') {
-      player.activeDeck = [];
-      saveData();
-      await interaction.reply({ embeds: [new EmbedBuilder().setTitle('🗑️ Active Deck Cleared!').setDescription('Your active deck has been cleared. Random cards from your full deck will be used in battles.').setColor(0x636e72)] });
+      player.activeDeck = []; saveData();
+      await interaction.reply({ embeds: [new EmbedBuilder().setTitle('🗑️ Active Deck Cleared!').setDescription('Random cards from your full deck will be used in battles.').setColor(0x636e72)] });
     }
 
     // /order
     else if (commandName === 'order') {
       const by = interaction.options.getString('by');
       const uniqueIds = [...new Set(player.deck)].filter(id => CARDS[id]);
-
       const RARITY_ORDER = { 'Common': 0, 'Uncommon': 1, 'Rare': 2, 'EX': 3, 'LEGENDARY': 4 };
-
       let sorted;
       if (by === 'rarity') sorted = uniqueIds.sort((a, b) => (RARITY_ORDER[CARDS[b].rarity] || 0) - (RARITY_ORDER[CARDS[a].rarity] || 0));
       else if (by === 'hp') sorted = uniqueIds.sort((a, b) => CARDS[b].hp - CARDS[a].hp);
       else if (by === 'name') sorted = uniqueIds.sort((a, b) => CARDS[a].name.localeCompare(CARDS[b].name));
       else if (by === 'wins') sorted = uniqueIds.sort((a, b) => (player.cardWins[b] || 0) - (player.cardWins[a] || 0));
       else if (by === 'level') sorted = uniqueIds.sort((a, b) => getCardLevel(player, b) - getCardLevel(player, a));
-
       const lines = sorted.map(id => {
-        const c = CARDS[id]; const lvl = getCardLevel(player, id);
-        const wins = player.cardWins[id] || 0;
+        const c = CARDS[id]; const lvl = getCardLevel(player, id); const wins = player.cardWins[id] || 0;
         const inActive = player.activeDeck && player.activeDeck.includes(id) ? ' 🎯' : '';
         return `${c.emoji} **${c.name}**${inActive} — ${c.hp}HP | ${c.rarity} | Lv${lvl} | ${wins}W`;
       });
-
       const labels = { rarity: '⭐ Rarity', hp: '❤️ HP', name: '🔤 Name', wins: '🏆 Wins', level: '⬆️ Level' };
       await interaction.reply({ embeds: [new EmbedBuilder().setTitle(`📋 Your Cards — Sorted by ${labels[by]}`).setDescription(lines.join('\n') || 'No cards!').setColor(0x9b59b6).setFooter({ text: `💎 ${player.gems} gems | ${player.deck.length} total cards` })] });
     }
@@ -617,8 +719,7 @@ client.on('interactionCreate', async (interaction) => {
       }
       const reward = Math.floor(Math.random() * 151) + 50;
       const total = reward * gemMultiplier();
-      player.gems += total; player.lastDaily = now;
-      saveData();
+      player.gems += total; player.lastDaily = now; saveData();
       await interaction.reply({ embeds: [new EmbedBuilder().setTitle('🎁 Daily Reward!').setDescription(`+**${total}💎 gems**${doubleGemsEvent ? ' (×2!)' : ''}\nTotal: **${player.gems}💎**`).setColor(0x00b894)] });
     }
 
@@ -635,6 +736,11 @@ client.on('interactionCreate', async (interaction) => {
       );
       const holders = Object.values(ARENAS).filter(a => a.holder).map(a => `${a.emoji} **${a.name}** → ${a.holderName}`).join('\n');
       if (holders) embed.addFields({ name: '🏟️ Arena Holders', value: holders });
+      // Show active bounties
+      if (bounties.size > 0) {
+        const bList = [...bounties.entries()].map(([tid, b]) => `🎯 **${b.targetName}** — **${b.amount}💎**`).join('\n');
+        embed.addFields({ name: '🎯 Active Bounties', value: bList });
+      }
       await interaction.reply({ embeds: [embed] });
     }
 
@@ -654,6 +760,10 @@ client.on('interactionCreate', async (interaction) => {
       }
       const leveled = Object.entries(player.cardLevels || {}).filter(([, lv]) => lv > 1).map(([id, lv]) => CARDS[id] ? `${CARDS[id].emoji} ${CARDS[id].name}: Lv${lv}` : null).filter(Boolean);
       if (leveled.length) embed.addFields({ name: '⬆️ Leveled Cards', value: leveled.join('\n') });
+      if (bounties.has(userId)) {
+        const b = bounties.get(userId);
+        embed.addFields({ name: '🎯 Bounty on You', value: `**${b.amount}💎** — set by ${b.setByName}` });
+      }
       await interaction.reply({ embeds: [embed] });
     }
 
@@ -690,15 +800,6 @@ client.on('interactionCreate', async (interaction) => {
       await interaction.reply({ embeds: [embed] });
     }
 
-    // /buycard
-    else if (commandName === 'buycard') {
-      const cardId = interaction.options.getString('card'); const card = CARDS[cardId];
-      if (!card) return interaction.reply({ content: '❌ Card not found.', ephemeral: true });
-      if (player.gems < card.gemCost) return interaction.reply({ content: `❌ Need ${card.gemCost}💎, have ${player.gems}💎.`, ephemeral: true });
-      player.gems -= card.gemCost; player.deck.push(cardId); saveData();
-      await interaction.reply({ embeds: [new EmbedBuilder().setTitle('🛒 Card Purchased!').setDescription(`${card.emoji} **${card.name}** added to your deck!`).setColor(card.color).setFooter({ text: `Remaining: ${player.gems}💎` })] });
-    }
-
     // /name
     else if (commandName === 'name') {
       const cardId = interaction.options.getString('card'); const nickname = interaction.options.getString('nickname');
@@ -706,47 +807,6 @@ client.on('interactionCreate', async (interaction) => {
       player.nicknames[cardId] = nickname; saveData();
       const c = CARDS[cardId];
       await interaction.reply({ embeds: [new EmbedBuilder().setTitle('✏️ Nickname Set!').setDescription(`${c.emoji} **${c.name}** is now *"${nickname}"*!`).setColor(c.color)] });
-    }
-
-    // /gamble
-    else if (commandName === 'gamble') {
-      const amount = interaction.options.getInteger('amount');
-      if (player.gems < amount) return interaction.reply({ content: `❌ You only have ${player.gems}💎!`, ephemeral: true });
-      const roll = Math.random();
-      let result;
-      if (roll < 0.45) { player.gems += amount; result = `🎰 **YOU WIN!** +${amount}💎\nBalance: **${player.gems}💎**`; }
-      else if (roll < 0.55) { const lost = Math.floor(amount / 2); player.gems -= lost; result = `🎰 **PUSH!** -${lost}💎\nBalance: **${player.gems}💎**`; }
-      else { player.gems -= amount; result = `🎰 **YOU LOSE!** -${amount}💎\nBalance: **${player.gems}💎**`; }
-      saveData();
-      await interaction.reply({ embeds: [new EmbedBuilder().setTitle('🎰 Gem Gamble!').setDescription(`You bet **${amount}💎**\n\n${result}`).setColor(roll < 0.45 ? 0x00b894 : roll < 0.55 ? 0xf39c12 : 0xe74c3c)] });
-    }
-
-    // /gift
-    else if (commandName === 'gift') {
-      const target = interaction.options.getUser('user'); const cardId = interaction.options.getString('card'); const card = CARDS[cardId];
-      if (!player.deck.includes(cardId)) return interaction.reply({ content: `❌ You don't have **${card?.name}**!`, ephemeral: true });
-      if (target.id === userId) return interaction.reply({ content: '❌ Cannot gift yourself!', ephemeral: true });
-      player.deck.splice(player.deck.indexOf(cardId), 1);
-      getPlayer(target.id).deck.push(cardId); saveData();
-      await interaction.reply({ embeds: [new EmbedBuilder().setTitle('🎁 Card Gifted!').setDescription(`${interaction.user.displayName} gifted ${card.emoji} **${card.name}** to **${target.displayName}**!`).setColor(0x00b894)] });
-    }
-
-    // /trade
-    else if (commandName === 'trade') {
-      const target = interaction.options.getUser('user'); const giveId = interaction.options.getString('yougive'); const wantId = interaction.options.getString('youget');
-      if (!player.deck.includes(giveId)) return interaction.reply({ content: `❌ You don't have **${CARDS[giveId]?.name}**!`, ephemeral: true });
-      if (target.id === userId) return interaction.reply({ content: '❌ Cannot trade with yourself!', ephemeral: true });
-      const tradeId = tradeCounter++;
-      tradeOffers.set(tradeId, { tradeId, fromId: userId, fromName: interaction.user.displayName, toId: target.id, toName: target.displayName, giveId, wantId });
-      const gCard = CARDS[giveId]; const wCard = CARDS[wantId];
-      const embed = new EmbedBuilder().setTitle('🔄 Trade Offer!').setDescription(`**${interaction.user.displayName}** wants to trade with **${target.displayName}**!`).setColor(0x6c5ce7)
-        .addFields({ name: '📤 They offer', value: `${gCard.emoji} **${gCard.name}**`, inline: true }, { name: '📥 They want', value: `${wCard.emoji} **${wCard.name}**`, inline: true })
-        .setFooter({ text: `Trade #${tradeId} — ${target.displayName}, do you accept?` });
-      const row = new ActionRowBuilder().addComponents(
-        new ButtonBuilder().setCustomId(`trade_accept_${tradeId}`).setLabel('✅ Accept Trade').setStyle(ButtonStyle.Success),
-        new ButtonBuilder().setCustomId(`trade_decline_${tradeId}`).setLabel('❌ Decline').setStyle(ButtonStyle.Danger),
-      );
-      await interaction.reply({ embeds: [embed], components: [row] });
     }
 
     // /arenas
@@ -781,6 +841,7 @@ client.on('interactionCreate', async (interaction) => {
       const challenger = interaction.user; const opponent = interaction.options.getUser('opponent');
       if (opponent.id === challenger.id) return interaction.reply({ content: '❌ Cannot battle yourself!', ephemeral: true });
       if (opponent.bot) return interaction.reply({ content: '❌ Cannot battle a bot!', ephemeral: true });
+      if (isBanned(opponent.id)) return interaction.reply({ content: '❌ That player is banned.', ephemeral: true });
       const cp = getPlayer(challenger.id); const op = getPlayer(opponent.id);
       if (cp.deck.length === 0) return interaction.reply({ content: '❌ You have no cards!', ephemeral: true });
       if (op.deck.length === 0) return interaction.reply({ content: `❌ ${opponent.displayName} has no cards!`, ephemeral: true });
@@ -797,11 +858,173 @@ client.on('interactionCreate', async (interaction) => {
         turn: challenger.id, accepted: false,
       });
       const embed = new EmbedBuilder().setTitle('⚔️ TFCImon Battle Challenge!').setDescription(`${challenger.displayName} challenges ${opponent} to a battle!`).setColor(0xe74c3c)
-        .addFields({ name: `${cCard.emoji} ${challenger.displayName}`, value: `**${cCard.name}** Lv${cLevel} — ${cCard.hp}HP${cBonus ? ' ⚡+2' : ''}`, inline: true }, { name: '⚔️ VS', value: '─────', inline: true }, { name: `${oCard.emoji} ${opponent.displayName}`, value: `**${oCard.name}** Lv${oLevel} — ${oCard.hp}HP${oBonus ? ' ⚡+2' : ''}`, inline: true })
-        .setFooter({ text: `${opponent.displayName}, do you accept?` });
+        .addFields(
+          { name: `${cCard.emoji} ${challenger.displayName}`, value: `**${cCard.name}** Lv${cLevel} — ${cCard.hp}HP${cBonus ? ' ⚡+2' : ''}`, inline: true },
+          { name: '⚔️ VS', value: '─────', inline: true },
+          { name: `${oCard.emoji} ${opponent.displayName}`, value: `**${oCard.name}** Lv${oLevel} — ${oCard.hp}HP${oBonus ? ' ⚡+2' : ''}`, inline: true },
+        ).setFooter({ text: `${opponent.displayName}, do you accept?` });
       const row = new ActionRowBuilder().addComponents(
         new ButtonBuilder().setCustomId(`accept_${battleId}`).setLabel('✅ Accept').setStyle(ButtonStyle.Success),
         new ButtonBuilder().setCustomId(`decline_${battleId}`).setLabel('❌ Decline').setStyle(ButtonStyle.Danger),
+      );
+      await interaction.reply({ embeds: [embed], components: [row] });
+    }
+
+    // ─── GAMBLING ───
+
+    // /gamble
+    else if (commandName === 'gamble') {
+      const amount = interaction.options.getInteger('amount');
+      if (player.gems < amount) return interaction.reply({ content: `❌ You only have ${player.gems}💎!`, ephemeral: true });
+      const roll = Math.random();
+      let result;
+      if (roll < 0.45) { player.gems += amount; result = `🎰 **YOU WIN!** +${amount}💎\nBalance: **${player.gems}💎**`; }
+      else if (roll < 0.55) { const lost = Math.floor(amount / 2); player.gems -= lost; result = `🎰 **PUSH!** -${lost}💎\nBalance: **${player.gems}💎**`; }
+      else { player.gems -= amount; result = `🎰 **YOU LOSE!** -${amount}💎\nBalance: **${player.gems}💎**`; }
+      saveData();
+      await interaction.reply({ embeds: [new EmbedBuilder().setTitle('🎰 Gem Gamble!').setDescription(`You bet **${amount}💎**\n\n${result}`).setColor(roll < 0.45 ? 0x00b894 : roll < 0.55 ? 0xf39c12 : 0xe74c3c)] });
+    }
+
+    // /coinflip
+    else if (commandName === 'coinflip') {
+      const amount = interaction.options.getInteger('amount');
+      const call = interaction.options.getString('call');
+      if (player.gems < amount) return interaction.reply({ content: `❌ You only have ${player.gems}💎!`, ephemeral: true });
+      const result = Math.random() < 0.5 ? 'heads' : 'tails';
+      const won = result === call;
+      if (won) player.gems += amount;
+      else player.gems -= amount;
+      saveData();
+      const emoji = result === 'heads' ? '🪙' : '🔵';
+      await interaction.reply({ embeds: [new EmbedBuilder()
+        .setTitle(`${emoji} Coin Flip!`)
+        .setDescription(`You called **${call}** — it landed on **${result}**!\n\n${won ? `✅ **YOU WIN! +${amount}💎**` : `❌ **YOU LOSE! -${amount}💎**`}\nBalance: **${player.gems}💎**`)
+        .setColor(won ? 0x00b894 : 0xe74c3c)
+      ] });
+    }
+
+    // /slots
+    else if (commandName === 'slots') {
+      const amount = interaction.options.getInteger('amount');
+      if (player.gems < amount) return interaction.reply({ content: `❌ You only have ${player.gems}💎!`, ephemeral: true });
+      const reels = spinSlots();
+      const multiplier = evalSlots(reels);
+      let resultText;
+      if (multiplier === 0) {
+        player.gems -= amount;
+        resultText = `❌ No match! **-${amount}💎**`;
+      } else {
+        const winnings = Math.floor(amount * multiplier) - amount;
+        player.gems += winnings;
+        resultText = `✅ **${multiplier}x multiplier!** +${winnings}💎`;
+      }
+      saveData();
+
+      const payoutTable = Object.entries(SLOT_PAYOUTS).filter(([k]) => k !== 'pair').map(([k, v]) => `${k} = **${v}x**`).join(' | ');
+      await interaction.reply({ embeds: [new EmbedBuilder()
+        .setTitle('🎰 Slot Machine!')
+        .setDescription(`\`\`\`\n[ ${reels.join(' | ')} ]\n\`\`\`\n${resultText}\nBalance: **${player.gems}💎**`)
+        .addFields({ name: '📊 Payouts', value: payoutTable + '\nAny pair = **1.5x**' })
+        .setColor(multiplier > 0 ? 0xf1c40f : 0xe74c3c)
+      ] });
+    }
+
+    // /dice
+    else if (commandName === 'dice') {
+      const amount = interaction.options.getInteger('amount');
+      const mode = interaction.options.getString('mode');
+      if (player.gems < amount) return interaction.reply({ content: `❌ You only have ${player.gems}💎!`, ephemeral: true });
+
+      let description = '';
+      let won = false;
+
+      if (mode === 'classic') {
+        const playerRoll = Math.floor(Math.random() * 6) + 1;
+        const houseRoll = Math.floor(Math.random() * 6) + 1;
+        won = playerRoll > houseRoll;
+        const tie = playerRoll === houseRoll;
+        if (tie) {
+          description = `🎲 You: **${playerRoll}** | House: **${houseRoll}**\n🤝 **TIE!** Your bet is returned.`;
+        } else {
+          description = `🎲 You: **${playerRoll}** | House: **${houseRoll}**\n${won ? `✅ **YOU WIN! +${amount}💎**` : `❌ **YOU LOSE! -${amount}💎**`}`;
+          if (won) player.gems += amount; else player.gems -= amount;
+        }
+      } else if (mode === 'highstakes') {
+        const d1 = Math.floor(Math.random() * 6) + 1;
+        const d2 = Math.floor(Math.random() * 6) + 1;
+        const total = d1 + d2;
+        won = total > 7;
+        const tie = total === 7;
+        if (tie) {
+          description = `🎲🎲 Rolled: **${d1}** + **${d2}** = **${total}**\n🤝 **EXACTLY 7 — TIE!** Bet returned.`;
+        } else {
+          const mult = won ? (total >= 11 ? 3 : 2) : 1;
+          const change = Math.floor(amount * (mult - 1));
+          description = `🎲🎲 Rolled: **${d1}** + **${d2}** = **${total}** (need >7)\n${won ? `✅ **WIN! +${change}💎** (${mult}x)` : `❌ **LOSE! -${amount}💎**`}`;
+          if (won) player.gems += change; else player.gems -= amount;
+        }
+      } else if (mode === 'lucky21') {
+        const d20 = Math.floor(Math.random() * 20) + 1;
+        const d6 = Math.floor(Math.random() * 6) + 1;
+        const total = d20 + d6;
+        won = total === 21;
+        const bust = total > 21;
+        description = `🎲 d20: **${d20}** + d6: **${d6}** = **${total}**\n`;
+        if (won) {
+          const jackpot = amount * 5;
+          player.gems += jackpot;
+          description += `🎉 **LUCKY 21! JACKPOT! +${jackpot}💎 (5x)**`;
+        } else if (bust) {
+          player.gems -= amount;
+          description += `💥 **BUST (over 21)! -${amount}💎**`;
+        } else {
+          player.gems -= Math.floor(amount / 2);
+          description += `😬 **No 21... -${Math.floor(amount / 2)}💎** (half loss for under)`;
+        }
+      }
+
+      saveData();
+      await interaction.reply({ embeds: [new EmbedBuilder()
+        .setTitle(`🎲 Dice — ${mode === 'classic' ? 'Classic' : mode === 'highstakes' ? 'High Stakes' : 'Lucky 21'}`)
+        .setDescription(description + `\nBalance: **${player.gems}💎**`)
+        .setColor(won ? 0x00b894 : 0xe74c3c)
+      ] });
+    }
+
+    // /bounties
+    else if (commandName === 'bounties') {
+      if (bounties.size === 0) return interaction.reply({ content: '🎯 No active bounties right now!', ephemeral: false });
+      const embed = new EmbedBuilder().setTitle('🎯 Active Bounties').setDescription('Defeat these players in PvP to collect the reward!').setColor(0xe17055);
+      for (const [tid, b] of bounties.entries()) {
+        embed.addFields({ name: `${b.targetName}`, value: `💰 **${b.amount}💎** — set by ${b.setByName}` });
+      }
+      await interaction.reply({ embeds: [embed] });
+    }
+
+    // /gift
+    else if (commandName === 'gift') {
+      const target = interaction.options.getUser('user'); const cardId = interaction.options.getString('card'); const card = CARDS[cardId];
+      if (!player.deck.includes(cardId)) return interaction.reply({ content: `❌ You don't have **${card?.name}**!`, ephemeral: true });
+      if (target.id === userId) return interaction.reply({ content: '❌ Cannot gift yourself!', ephemeral: true });
+      player.deck.splice(player.deck.indexOf(cardId), 1);
+      getPlayer(target.id).deck.push(cardId); saveData();
+      await interaction.reply({ embeds: [new EmbedBuilder().setTitle('🎁 Card Gifted!').setDescription(`${interaction.user.displayName} gifted ${card.emoji} **${card.name}** to **${target.displayName}**!`).setColor(0x00b894)] });
+    }
+
+    // /trade
+    else if (commandName === 'trade') {
+      const target = interaction.options.getUser('user'); const giveId = interaction.options.getString('yougive'); const wantId = interaction.options.getString('youget');
+      if (!player.deck.includes(giveId)) return interaction.reply({ content: `❌ You don't have **${CARDS[giveId]?.name}**!`, ephemeral: true });
+      if (target.id === userId) return interaction.reply({ content: '❌ Cannot trade with yourself!', ephemeral: true });
+      const tradeId = tradeCounter++;
+      tradeOffers.set(tradeId, { tradeId, fromId: userId, fromName: interaction.user.displayName, toId: target.id, toName: target.displayName, giveId, wantId });
+      const gCard = CARDS[giveId]; const wCard = CARDS[wantId];
+      const embed = new EmbedBuilder().setTitle('🔄 Trade Offer!').setDescription(`**${interaction.user.displayName}** wants to trade with **${target.displayName}**!`).setColor(0x6c5ce7)
+        .addFields({ name: '📤 They offer', value: `${gCard.emoji} **${gCard.name}**`, inline: true }, { name: '📥 They want', value: `${wCard.emoji} **${wCard.name}**`, inline: true })
+        .setFooter({ text: `Trade #${tradeId} — ${target.displayName}, do you accept?` });
+      const row = new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId(`trade_accept_${tradeId}`).setLabel('✅ Accept Trade').setStyle(ButtonStyle.Success),
+        new ButtonBuilder().setCustomId(`trade_decline_${tradeId}`).setLabel('❌ Decline').setStyle(ButtonStyle.Danger),
       );
       await interaction.reply({ embeds: [embed], components: [row] });
     }
@@ -881,44 +1104,51 @@ client.on('interactionCreate', async (interaction) => {
       const m3 = interaction.options.getString('move3'); const m3d = interaction.options.getInteger('move3dmg'); const m3c = interaction.options.getInteger('move3cost') || 5;
       const gemCost = interaction.options.getInteger('gemcost') || 500;
       const giveToUser = interaction.options.getUser('giveto');
-
       const newId = `custom_${Date.now()}`;
       const moves = [
         { name: m1, damage: m1d, cost: m1c, emoji: '⚔️' },
         { name: m2, damage: m2d, cost: m2c, emoji: '💥' },
       ];
       if (m3 && m3d) moves.push({ name: m3, damage: m3d, cost: m3c, emoji: '🌟' });
-
       CARDS[newId] = { id: newId, name, hp, type, rarity, emoji, color: 0x6c5ce7, description: `Custom card created by ${interaction.user.displayName}.`, gemCost, moves };
-
       if (giveToUser) getPlayer(giveToUser.id).deck.push(newId);
       saveData();
-
       const movesText = moves.map(m => `${m.emoji} **${m.name}**: ${m.damage}dmg (${m.cost}⚡)`).join('\n');
       await interaction.reply({ embeds: [new EmbedBuilder()
         .setTitle(`${emoji} Custom Card Created: ${name}`)
-        .setDescription(`This card is now in the game permanently!\n\n**${hp}HP | ${type} | ${rarity}**\n\n${movesText}${giveToUser ? `\n\n✅ Given to **${giveToUser.displayName}**!` : ''}`)
-        .setColor(0x6c5ce7)
-        .setFooter({ text: `Card ID: ${newId} | Shop price: ${gemCost}💎` })
+        .setDescription(`**${hp}HP | ${type} | ${rarity}**\n\n${movesText}${giveToUser ? `\n\n✅ Given to **${giveToUser.displayName}**!` : ''}`)
+        .setColor(0x6c5ce7).setFooter({ text: `Card ID: ${newId} | Shop price: ${gemCost}💎` })
       ] });
     }
 
     // /editcard
     else if (commandName === 'editcard') {
       if (!isOp(interaction)) return interaction.reply({ content: '❌ No permission.', ephemeral: true });
-      const cardId = interaction.options.getString('card');
-      const card = CARDS[cardId];
+      const cardId = interaction.options.getString('card'); const card = CARDS[cardId];
       if (!card) return interaction.reply({ content: `❌ Card with ID **${cardId}** not found!`, ephemeral: true });
-      const newHp = interaction.options.getInteger('hp');
-      const newName = interaction.options.getString('name');
-      const newRarity = interaction.options.getString('rarity');
-      const newEmoji = interaction.options.getString('emoji');
-      if (newHp) card.hp = newHp;
-      if (newName) card.name = newName;
-      if (newRarity) card.rarity = newRarity;
-      if (newEmoji) card.emoji = newEmoji;
+      const newHp = interaction.options.getInteger('hp'); const newName = interaction.options.getString('name');
+      const newRarity = interaction.options.getString('rarity'); const newEmoji = interaction.options.getString('emoji');
+      if (newHp) card.hp = newHp; if (newName) card.name = newName; if (newRarity) card.rarity = newRarity; if (newEmoji) card.emoji = newEmoji;
       saveData();
-      await interaction.reply({ embeds: [new EmbedBuilder().setTitle('✏️ Card Edited!').setDescription(`${card.emoji} **${card.name}** has been updated!\nHP: ${card.hp} | Rarity: ${card.rarity}`).setColor(0x6c5ce7)] });
+      await interaction.reply({ embeds: [new EmbedBuilder().setTitle('✏️ Card Edited!').setDescription(`${card.emoji} **${card.name}** updated!\nHP: ${card.hp} | Rarity: ${card.rarity}`).setColor(0x6c5ce7)] });
+    }
+
+    // /setrarity
+    else if (commandName === 'setrarity') {
+      if (!isOp(interaction)) return interaction.reply({ content: '❌ No permission.', ephemeral: true });
+      const cardId = interaction.options.getString('card'); const rarity = interaction.options.getString('rarity');
+      const card = CARDS[cardId];
+      if (!card) return interaction.reply({ content: `❌ Card **${cardId}** not found!`, ephemeral: true });
+      const old = card.rarity; card.rarity = rarity; saveData();
+      await interaction.reply({ embeds: [new EmbedBuilder().setTitle('⭐ Rarity Updated!').setDescription(`${card.emoji} **${card.name}**: ${old} → **${rarity}**`).setColor(0xf1c40f)] });
+    }
+
+    // /setgems
+    else if (commandName === 'setgems') {
+      if (!isOp(interaction)) return interaction.reply({ content: '❌ No permission.', ephemeral: true });
+      const target = interaction.options.getUser('user'); const amount = interaction.options.getInteger('amount');
+      const tp = getPlayer(target.id); tp.gems = amount; saveData();
+      await interaction.reply({ embeds: [new EmbedBuilder().setTitle('💎 Gems Set!').setDescription(`**${target.displayName}**'s gems set to **${amount}💎**.`).setColor(0xf1c40f)] });
     }
 
     // /givegems
@@ -954,6 +1184,63 @@ client.on('interactionCreate', async (interaction) => {
       await interaction.reply({ embeds: [new EmbedBuilder().setTitle('💀 Player Wiped!').setDescription(`**${target.displayName}**'s deck wiped. 💀`).setColor(0xe74c3c)] });
     }
 
+    // /wipeall
+    else if (commandName === 'wipeall') {
+      if (!isOp(interaction)) return interaction.reply({ content: '❌ No permission.', ephemeral: true });
+      const confirm = new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId('wipeall_confirm').setLabel('⚠️ CONFIRM WIPE ALL').setStyle(ButtonStyle.Danger),
+        new ButtonBuilder().setCustomId('wipeall_cancel').setLabel('Cancel').setStyle(ButtonStyle.Secondary),
+      );
+      await interaction.reply({ content: '⚠️ **WARNING:** This will wipe ALL player data. Are you sure?', components: [confirm], ephemeral: true });
+    }
+
+    // /clonecard
+    else if (commandName === 'clonecard') {
+      if (!isOp(interaction)) return interaction.reply({ content: '❌ No permission.', ephemeral: true });
+      const cardId = interaction.options.getString('card'); const target = interaction.options.getUser('user');
+      const card = CARDS[cardId];
+      if (!card) return interaction.reply({ content: `❌ Card **${cardId}** not found!`, ephemeral: true });
+      getPlayer(target.id).deck.push(cardId); saveData();
+      await interaction.reply({ embeds: [new EmbedBuilder().setTitle('🔁 Card Cloned!').setDescription(`Gave a copy of ${card.emoji} **${card.name}** to **${target.displayName}**!`).setColor(card.color || 0x9b59b6)] });
+    }
+
+    // /banplayer
+    else if (commandName === 'banplayer') {
+      if (!isOp(interaction)) return interaction.reply({ content: '❌ No permission.', ephemeral: true });
+      const target = interaction.options.getUser('user'); const reason = interaction.options.getString('reason') || 'No reason given.';
+      if (bannedUsers.includes(target.id)) return interaction.reply({ content: `❌ **${target.displayName}** is already banned.`, ephemeral: true });
+      bannedUsers.push(target.id); saveData();
+      await interaction.reply({ embeds: [new EmbedBuilder().setTitle('🔨 Player Banned!').setDescription(`**${target.displayName}** has been banned from TFCImon.\n**Reason:** ${reason}`).setColor(0xe74c3c)] });
+    }
+
+    // /unbanplayer
+    else if (commandName === 'unbanplayer') {
+      if (!isOp(interaction)) return interaction.reply({ content: '❌ No permission.', ephemeral: true });
+      const target = interaction.options.getUser('user');
+      if (!bannedUsers.includes(target.id)) return interaction.reply({ content: `❌ **${target.displayName}** is not banned.`, ephemeral: true });
+      bannedUsers = bannedUsers.filter(id => id !== target.id); saveData();
+      await interaction.reply({ embeds: [new EmbedBuilder().setTitle('✅ Player Unbanned!').setDescription(`**${target.displayName}** can use TFCImon again.`).setColor(0x00b894)] });
+    }
+
+    // /setarenacholder
+    else if (commandName === 'setarenacholder') {
+      if (!isOp(interaction)) return interaction.reply({ content: '❌ No permission.', ephemeral: true });
+      const arenaId = interaction.options.getString('arena'); const target = interaction.options.getUser('user');
+      const arena = ARENAS[arenaId];
+      arena.holder = target.id; arena.holderName = target.displayName; saveData();
+      await interaction.reply({ embeds: [new EmbedBuilder().setTitle('👑 Arena Holder Set!').setDescription(`**${target.displayName}** is now the holder of **${arena.emoji} ${arena.name}**!`).setColor(arena.color)] });
+    }
+
+    // /broadcast
+    else if (commandName === 'broadcast') {
+      if (!isOp(interaction)) return interaction.reply({ content: '❌ No permission.', ephemeral: true });
+      const title = interaction.options.getString('title');
+      const message = interaction.options.getString('message');
+      const colorStr = interaction.options.getString('color');
+      const color = colorStr ? parseInt(colorStr, 16) : 0xfdcb6e;
+      await interaction.reply({ embeds: [new EmbedBuilder().setTitle(`📢 ${title}`).setDescription(message).setColor(color).setFooter({ text: `TFCImon • Broadcast by ${interaction.user.displayName}` }).setTimestamp()] });
+    }
+
     // /resetarena
     else if (commandName === 'resetarena') {
       if (!isOp(interaction)) return interaction.reply({ content: '❌ No permission.', ephemeral: true });
@@ -981,7 +1268,7 @@ client.on('interactionCreate', async (interaction) => {
       if (!isOp(interaction)) return interaction.reply({ content: '❌ No permission.', ephemeral: true });
       if (!activeTournament.running) {
         activeTournament.running = true; activeTournament.players = []; activeTournament.bracket = [];
-        return interaction.reply({ embeds: [new EmbedBuilder().setTitle('🏆 Tournament Open!').setDescription('Use `/jointournament` to enter!\nOP run this command again to start the bracket.').setColor(0xf1c40f)] });
+        return interaction.reply({ embeds: [new EmbedBuilder().setTitle('🏆 Tournament Open!').setDescription('Use `/jointournament` to enter!\nRun this command again to start the bracket.').setColor(0xf1c40f)] });
       }
       if (activeTournament.players.length < 2) {
         activeTournament.running = false; activeTournament.players = [];
@@ -1004,21 +1291,40 @@ client.on('interactionCreate', async (interaction) => {
       if (custom.length > 0) desc += `\n\n**Custom Cards (${custom.length}):**\n${custom.map(c => `${c.emoji} ${c.name} — ID: \`${c.id}\``).join('\n')}`;
       await interaction.reply({ embeds: [new EmbedBuilder().setTitle('📋 All TFCImon Cards').setDescription(desc).setColor(0x6c5ce7)] });
     }
+
+    // /setbounty
+    else if (commandName === 'setbounty') {
+      if (!isOp(interaction)) return interaction.reply({ content: '❌ No permission.', ephemeral: true });
+      const target = interaction.options.getUser('user'); const amount = interaction.options.getInteger('amount');
+      if (target.id === userId) return interaction.reply({ content: '❌ Cannot bounty yourself!', ephemeral: true });
+      bounties.set(target.id, { amount, setBy: userId, setByName: interaction.user.displayName, targetName: target.displayName });
+      saveData();
+      await interaction.reply({ embeds: [new EmbedBuilder()
+        .setTitle('🎯 Bounty Placed!')
+        .setDescription(`A **${amount}💎** bounty has been placed on **${target.displayName}**!\nFirst player to defeat them in PvP collects the reward!`)
+        .setColor(0xe17055)
+      ] });
+    }
+
+    // /removebounty
+    else if (commandName === 'removebounty') {
+      if (!isOp(interaction)) return interaction.reply({ content: '❌ No permission.', ephemeral: true });
+      const target = interaction.options.getUser('user');
+      if (!bounties.has(target.id)) return interaction.reply({ content: `❌ No bounty on **${target.displayName}**.`, ephemeral: true });
+      bounties.delete(target.id); saveData();
+      await interaction.reply({ embeds: [new EmbedBuilder().setTitle('🎯 Bounty Removed').setDescription(`Bounty on **${target.displayName}** has been removed.`).setColor(0x636e72)] });
+    }
   }
 
   // ── SELECT MENUS ──
   else if (interaction.isStringSelectMenu()) {
     const userId = interaction.user.id;
-
     if (interaction.customId === `builddeck_select_${userId}`) {
       const player = getPlayer(userId);
       const selected = interaction.values;
-      player.activeDeck = selected;
-      saveData();
-      const names = selected.map(id => {
-        const c = CARDS[id]; return c ? `${c.emoji} **${c.name}**` : id;
-      }).join(', ');
-      await interaction.reply({ embeds: [new EmbedBuilder().setTitle('🎯 Active Deck Set!').setDescription(`Your battle deck is now:\n${names}\n\nIn battles, a random card from this selection will be used!\nUse \`/cleardeck\` to reset to random.`).setColor(0x00b894)] });
+      player.activeDeck = selected; saveData();
+      const names = selected.map(id => { const c = CARDS[id]; return c ? `${c.emoji} **${c.name}**` : id; }).join(', ');
+      await interaction.reply({ embeds: [new EmbedBuilder().setTitle('🎯 Active Deck Set!').setDescription(`Your battle deck is now:\n${names}\n\nUse \`/cleardeck\` to reset to random.`).setColor(0x00b894)] });
     }
   }
 
@@ -1028,8 +1334,17 @@ client.on('interactionCreate', async (interaction) => {
     const userId = interaction.user.id;
     const player = getPlayer(userId);
 
+    // Wipe all confirm/cancel
+    if (customId === 'wipeall_confirm') {
+      if (!opUsers.includes(userId) && interaction.user.username !== OP_USER) return interaction.reply({ content: '❌ No permission.', ephemeral: true });
+      playerData.clear(); saveData();
+      await interaction.update({ content: '💀 **All player data wiped.**', components: [] });
+    } else if (customId === 'wipeall_cancel') {
+      await interaction.update({ content: '✅ Wipe cancelled.', components: [] });
+    }
+
     // Trade
-    if (customId.startsWith('trade_accept_') || customId.startsWith('trade_decline_')) {
+    else if (customId.startsWith('trade_accept_') || customId.startsWith('trade_decline_')) {
       const tradeId = parseInt(customId.replace('trade_accept_', '').replace('trade_decline_', ''));
       const trade = tradeOffers.get(tradeId);
       if (!trade) return interaction.reply({ content: '❌ Trade expired.', ephemeral: true });
@@ -1103,6 +1418,7 @@ client.on('interactionCreate', async (interaction) => {
       attacker.energy = Math.min(attacker.energy + 1, 6); defender.energy = Math.min(defender.energy + 1, 6);
       battle.turn = defender.id;
       await interaction.update({ components: [] });
+
       if (defender.hp <= 0) {
         activeBattles.delete(battleId);
         const atkP = getPlayer(attacker.id); const defP = getPlayer(defender.id);
@@ -1113,8 +1429,18 @@ client.on('interactionCreate', async (interaction) => {
         const cWins = atkP.cardWins[attacker.cardId];
         if (cWins % 3 === 0) atkP.cardLevels[attacker.cardId] = (atkP.cardLevels[attacker.cardId] || 1) + 1;
         const lvlMsg = cWins % 3 === 0 ? `\n⬆️ **${aCard.name}** leveled up to Lv${atkP.cardLevels[attacker.cardId]}!` : '';
+
+        // ── BOUNTY CHECK ──
+        let bountyMsg = '';
+        if (bounties.has(defender.id)) {
+          const b = bounties.get(defender.id);
+          atkP.gems += b.amount;
+          bountyMsg = `\n🎯 **BOUNTY COLLECTED!** +${b.amount}💎 for defeating ${defender.name}!`;
+          bounties.delete(defender.id);
+        }
+
         saveData();
-        return interaction.channel.send({ embeds: [new EmbedBuilder().setTitle('🏆 Battle Over!').setDescription(`**${attacker.name}** wins! +${gemGain}💎${lvlMsg}\n${move.emoji} **${move.name}** dealt **${totalDmg}** as the finishing blow!`).setColor(0xf1c40f)] });
+        return interaction.channel.send({ embeds: [new EmbedBuilder().setTitle('🏆 Battle Over!').setDescription(`**${attacker.name}** wins! +${gemGain}💎${lvlMsg}${bountyMsg}\n${move.emoji} **${move.name}** dealt **${totalDmg}** as the finishing blow!`).setColor(0xf1c40f)] });
       }
       await sendBattleState(interaction.channel, battle, CARDS[battle.challenger.cardId], CARDS[battle.opponent.cardId], battleId, `${move.emoji} **${attacker.name}** used **${move.name}** → **${totalDmg}** damage!${bonus > 0 ? ` *(+${bonus} level bonus)*` : ''}`);
     }
